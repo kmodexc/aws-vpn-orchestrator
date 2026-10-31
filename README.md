@@ -57,6 +57,7 @@ The full contract is in [docs/SPEC.md](docs/SPEC.md).
 | A DNS name for the control plane | e.g. `vpn.kmode.dev`, A (and optionally AAAA) record → VPS — see step 1 |
 | Admin access to the Keycloak realm on `https://auth.kmode.dev` | see [docs/keycloak.md](docs/keycloak.md) |
 | An AWS account | ideally a **dedicated** account (or at least a region you use for nothing else) |
+| AWS CLI v2 with admin credentials (on your laptop or the VPS) | for the setup scripts in `deploy/aws/` (step 5); the control plane itself gets only a narrow key |
 | A proxy client | Hiddify, v2rayNG, NekoBox, sing-box for Android/iOS, … |
 
 ## Setup
@@ -64,12 +65,12 @@ The full contract is in [docs/SPEC.md](docs/SPEC.md).
 ### 1. DNS
 
 Create `A vpn.example.com → <VPS IPv4>` (and `AAAA → <VPS IPv6>` if the VPS has IPv6). Ports 80
-and 443 must be reachable from the internet; certbot validates the domain on port 80 (step 7).
+and 443 must be reachable from the internet; certbot validates the domain on port 80 (step 6).
 
 Apache runs directly on the host, so it sees every client's real IPv4 **and** IPv6 address and
 appends it to `X-Forwarded-For` for the app.
 
-After the first start (step 7), check that the app sees real client addresses: request
+After the first start (step 6), check that the app sees real client addresses: request
 `https://<DOMAIN>/healthz` from another machine and look at the `client_ip` field in
 `docker compose logs app`. It must show that machine's public IP, never `127.0.0.1` or a Docker
 address such as `172.x.x.x`. If it does, the per-IP limits do not work — check that the request
@@ -97,7 +98,73 @@ Follow [docs/keycloak.md](docs/keycloak.md): create the confidential client
 (`https://<DOMAIN>/auth/callback` as the only redirect URI), the realm role `vpn-admin`, assign it
 to your user and enable 2FA. Note the **issuer URL**, **client id** and **client secret**.
 
-### 4. AWS: the ingress instance
+### 4. Generate `.env`
+
+On the VPS, in the repository checkout:
+
+```bash
+umask 077
+docker compose run --rm --no-deps -T app gen-env > .env   # builds the image the first time
+chmod 600 .env
+$EDITOR .env
+```
+
+`gen-env` fills every secret with fresh random values (path tokens, VLESS UUID, REALITY keypair
+and short id, Hysteria2 password and self-signed certificate, Shadowsocks key, WireGuard keypair).
+Fill in the placeholders: `DOMAIN`, `PUBLIC_BASE_URL`, `OIDC_*`. `PROVIDER`, `AWS_*` and
+`INGRESS_INSTANCE` are written by the AWS setup script in step 5. Every variable is documented in [.env.example](.env.example).
+
+`APP_HOST_PORT` is the localhost port Apache forwards to (`gen-env` writes `11001` as an example).
+Port convention: apps bind to `127.0.0.1` on ports **`1xxyy`**, where `xx` (01–99) is the id of the
+application / compose stack and `yy` (01–99) numbers the ports of that stack that Apache forwards.
+This stack forwards exactly one port (`yy = 01`); pick a free `xx` (e.g. `10` → `11001`) and use
+the same port in the Apache vhost (step 6).
+
+### 5. AWS: ingress + IAM user (automated with the AWS CLI)
+
+[deploy/aws/setup-lightsail.sh](deploy/aws/setup-lightsail.sh) does the whole AWS side in one
+idempotent run. It uses **your admin credentials** (an AWS CLI v2 profile or SSO session) — the
+control plane itself only ever gets the narrow key the script creates for it.
+
+```bash
+# where you have admin AWS credentials and the .env from step 4
+# (Linux, macOS, WSL or Git Bash; needs aws CLI v2)
+deploy/aws/setup-lightsail.sh --profile admin --region ap-northeast-1   --budget-email you@example.com          # optional monthly cost alarm ($20 default)
+```
+
+What it does:
+
+1. creates a Lightsail instance (Ubuntu 24.04, cheapest bundle with IPv4, IPv4-only networking)
+   whose launch script runs [deploy/ingress/bootstrap.sh](deploy/ingress/bootstrap.sh) with
+   `PUBLIC_BASE_URL` and `INGRESS_TOKEN` from `.env` (passed via a 0600 temp file, never on a
+   command line)
+2. sets the Lightsail firewall to exactly the proxy ports (TCP `VLESS_PORT`, UDP `HY2_PORT`,
+   TCP+UDP `SS_PORT`) plus SSH from your current public IP (`--ssh-cidr`, or `--no-ssh`)
+3. allocates and attaches a static IP named `vpn-orchestrator-*` (the control plane rotates it)
+4. creates the IAM user `vpn-control` with the least-privilege policy
+   [deploy/iam/lightsail.json](deploy/iam/lightsail.json) pinned to this instance and region,
+   plus an access key
+5. writes `PROVIDER=lightsail`, `AWS_REGION`, `INGRESS_INSTANCE`, `AWS_ACCESS_KEY_ID` and
+   `AWS_SECRET_ACCESS_KEY` into `.env`
+
+Re-running it changes nothing that is already correct (it refreshes the firewall — e.g. when
+your own IP changed — and the IAM policy). `--help` lists all options.
+
+If you ran it on another machine, copy the updated `.env` to the VPS (`scp`, keep it 0600). The
+ingress configures itself within a few minutes and keeps retrying the config download every
+10 minutes until the control plane (step 6) answers.
+
+Two companion scripts:
+
+| Script | Use |
+|---|---|
+| [deploy/aws/rebuild-lightsail.sh](deploy/aws/rebuild-lightsail.sh) `--region ap-southeast-1` | Rotating the IP is not enough (whole range blocked): builds a fresh ingress in another region, re-pins the IAM policy, updates `.env`, deletes the old instance and its static IPs. Same secrets, so clients only need a subscription update. Then `docker compose up -d --force-recreate app`. |
+| [deploy/aws/teardown-lightsail.sh](deploy/aws/teardown-lightsail.sh) | Back home: deletes the instance, its static IPs, the IAM user (`--keep-iam` to keep it) and optionally the budget (`--budget`); clears the AWS key in `.env`. |
+
+EC2 is supported by the backend (`PROVIDER=ec2`) but has no setup script — use the manual steps
+below and [deploy/iam/ec2.json](deploy/iam/ec2.json).
+
+#### Manual alternative: the ingress instance
 
 **Lightsail** (simplest, cheapest):
 
@@ -105,7 +172,7 @@ to your user and enable 2FA. Note the **issuer URL**, **client id** and **client
    e.g. Frankfurt `eu-central-1`, Tokyo `ap-northeast-1` or Singapore `ap-southeast-1`.
 2. *Launch script*: paste [deploy/ingress/bootstrap.sh](deploy/ingress/bootstrap.sh) after
    filling in `CONTROL_PLANE_URL` (= `PUBLIC_BASE_URL`) and `INGRESS_TOKEN` (from your `.env`,
-   step 6). You can also create the instance first and run the script later via SSH. Never put
+   step 4). You can also create the instance first and run the script later via SSH. Never put
    the token on a command line: it would end up in your shell history and be visible in `ps` to
    every local user, including the `sing-box` user. Read it without echo and pass it through the
    environment instead:
@@ -139,7 +206,7 @@ to your user and enable 2FA. Note the **issuer URL**, **client id** and **client
 a security group with the ports above, IMDSv2 required, **no instance role**, and an Elastic IP
 tagged `vpn-orchestrator=managed` (or let the first rotation allocate one).
 
-### 5. AWS: IAM user for the control plane
+#### Manual alternative: IAM user for the control plane
 
 Create a dedicated IAM user (programmatic access only, no console) and attach an inline policy:
 
@@ -160,31 +227,7 @@ Scoping notes:
   only be created *with* the tag `vpn-orchestrator=managed`; only tagged EIPs can be associated
   (and only to the ingress instance) or released.
 
-### 6. Generate `.env`
-
-On the VPS, in the repository checkout:
-
-```bash
-umask 077
-docker compose run --rm --no-deps -T app gen-env > .env   # builds the image the first time
-chmod 600 .env
-$EDITOR .env
-```
-
-`gen-env` fills every secret with fresh random values (path tokens, VLESS UUID, REALITY keypair
-and short id, Hysteria2 password and self-signed certificate, Shadowsocks key, WireGuard keypair).
-Fill in the placeholders: `DOMAIN`, `PUBLIC_BASE_URL`, `OIDC_*`, `AWS_*`,
-`INGRESS_INSTANCE`, `PROVIDER`. Every variable is documented in [.env.example](.env.example).
-
-`APP_HOST_PORT` is the localhost port Apache forwards to (`gen-env` writes `11001` as an example).
-Port convention: apps bind to `127.0.0.1` on ports **`1xxyy`**, where `xx` (01–99) is the id of the
-application / compose stack and `yy` (01–99) numbers the ports of that stack that Apache forwards.
-This stack forwards exactly one port (`yy = 01`); pick a free `xx` (e.g. `10` → `11001`) and use
-the same port in the Apache vhost (step 7).
-
-Put `INGRESS_TOKEN` and `PUBLIC_BASE_URL` into the ingress bootstrap script (step 4).
-
-### 7. Start the app and configure Apache
+### 6. Start the app and configure Apache
 
 Start the app:
 
@@ -222,13 +265,13 @@ renewal (`sudo certbot renew --dry-run` to test).
 Recommended globally, in `/etc/apache2/conf-available/security.conf`: `ServerTokens Prod` and
 `ServerSignature Off` (Apache adds its own `Server: Apache` header; this keeps it minimal).
 
-### 8. First login
+### 7. First login
 
 Open `https://<DOMAIN>/`, click **Sign in**, authenticate at Keycloak (with your second factor).
 You should see the dashboard with the ingress status. "Your account lacks the required role" means
 the `vpn-admin` role is missing from the access token — see docs/keycloak.md.
 
-### 9. Import the subscription into a client
+### 8. Import the subscription into a client
 
 Dashboard → *Subscription* → **Show** → scan the QR code with the phone (or copy the URL).
 
@@ -246,6 +289,8 @@ After every IP rotation the clients pick up the new address on their next subscr
 | Task | How |
 |---|---|
 | Rotate the ingress IP | Dashboard → **Rotate IP** (cooldown `ROTATE_COOLDOWN_S`). Then update the subscription in your clients. |
+| Ingress range blocked / move region | `deploy/aws/rebuild-lightsail.sh --region <new>` (step 5), then `docker compose up -d --force-recreate app` and update the subscription in your clients. |
+| Your SSH IP changed | re-run `deploy/aws/setup-lightsail.sh` (refreshes the firewall). |
 | Logs | `docker compose logs -f app` (rotated: 3 × 10 MB); Apache: `/var/log/apache2/` (the vhost's access log replaces the URL of `/s/`, `/i/` and `/auth/callback` requests with a redacted line). Tokens and token paths are never logged. |
 | Status | `docker compose ps`; the app's `/healthz` is used by the container healthcheck. |
 | Backup | `.env` (encrypted, offline — e.g. password manager) is all you need to rebuild. Optional: the `app_state` volume (event log, burned IPs) and `/etc/letsencrypt` (certificates; can be re-issued with certbot if lost). |
