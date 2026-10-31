@@ -1,0 +1,80 @@
+# vpn-control — production stack
+#
+#   Internet ──443──► Apache2 on the host (TLS via certbot) ──► 127.0.0.1:${APP_HOST_PORT} ──► app:8080
+#
+# * Port convention: apps bind to 127.0.0.1 on 1xxyy (xx = stack id, yy = forwarded port 01..99).
+#   This stack forwards exactly one port; set APP_HOST_PORT in .env (e.g. 11001).
+#   The port is published on 127.0.0.1 ONLY — never on a public interface.
+#   Example Apache vhost: deploy/apache/vpn-control.conf
+# * All configuration and secrets live in ./.env (chmod 600). Create it with:
+#     docker compose run --rm --no-deps -T app gen-env > .env && chmod 600 .env
+#   then fill in the placeholders. See .env.example for every variable.
+# * Read-only root FS, all capabilities dropped, no-new-privileges, resource limits, rotated logs.
+
+name: vpn-control
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vpn-control:local
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Overrides .env: the port is reachable only from localhost (Apache), and Apache's mod_proxy
+      # APPENDS the real client address to X-Forwarded-For, so the right-most entry is trustworthy.
+      TRUST_PROXY_HEADERS: "true"
+      BIND_ADDR: "0.0.0.0:8080"
+      STATE_DIR: /data
+      STATIC_DIR: /app/static
+    # Loopback only: Apache on the host is the sole client. APP_HOST_PORT follows 1xxyy.
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-11001}:8080"
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    volumes:
+      - app_state:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/app/vpn-control", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 2s
+    # Must exceed the longest shutdown path: an in-flight /api/ingress/rotate may run for up to
+    # 90 s (request timeout) while axum drains, then the app waits up to 25 s more for the
+    # orchestrator to go idle. SIGKILL before that can leave a static IP detached/unreleased.
+    stop_grace_period: 120s
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - web
+    logging: *default-logging
+
+networks:
+  web:
+    driver: bridge
+    # Not "internal: true": the app needs egress to AWS and Keycloak.
+
+volumes:
+  app_state:

@@ -1,0 +1,35 @@
+# Allow-list: the build context contains ONLY what the Dockerfile needs (backend/ and frontend/).
+# Everything else — in particular .env, .git, docs and deploy material — never reaches the
+# Docker daemon and therefore can never be baked into an image layer.
+*
+!backend/
+!frontend/
+
+# Never send secrets, even if they sit inside an allowed directory.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+
+# Build output and dependencies (rebuilt inside the image).
+backend/target/
+**/target/
+frontend/node_modules/
+**/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# Editor / OS / VCS noise.
+**/.git
+**/.gitignore
+**/.idea
+**/.vscode
+**/.DS_Store
+**/*.log
+**/*.swp

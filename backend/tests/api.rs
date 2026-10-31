@@ -1,0 +1,878 @@
+//! Integration tests: the full router (all middleware) with PROVIDER=fake, driven through
+//! `tower::ServiceExt::oneshot`. No network access is needed: the OIDC issuer points at a closed
+//! local port, so IdP calls fail fast.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{Method, Request, StatusCode, header};
+use axum::response::Response;
+use base64::Engine;
+use http_body_util::BodyExt;
+use tempfile::TempDir;
+use tower::ServiceExt;
+use vpn_control::AppState;
+use vpn_control::auth::session::SessionData;
+use vpn_control::cli::gen_env;
+use vpn_control::config::Config;
+use vpn_control::providers::fake::FakeProvider;
+
+const BASE: &str = "https://vpn.example.com";
+const INDEX_HTML: &str = "<!doctype html><title>spa</title>";
+
+struct TestApp {
+    state: AppState,
+    router: Router,
+    sub_token: String,
+    ingress_token: String,
+    _state_dir: TempDir,
+    _static_dir: TempDir,
+}
+
+fn app_with(extra: &[(&str, &str)]) -> TestApp {
+    let state_dir = tempfile::tempdir().unwrap();
+    let static_dir = tempfile::tempdir().unwrap();
+    std::fs::write(static_dir.path().join("index.html"), INDEX_HTML).unwrap();
+    std::fs::create_dir(static_dir.path().join("assets")).unwrap();
+    std::fs::write(
+        static_dir.path().join("assets/app-abc123.js"),
+        "console.log(1)",
+    )
+    .unwrap();
+
+    let mut pairs: Vec<(String, String)> = gen_env::generate_secrets()
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let dirs = [
+        ("STATE_DIR", state_dir.path().to_string_lossy().into_owned()),
+        (
+            "STATIC_DIR",
+            static_dir.path().to_string_lossy().into_owned(),
+        ),
+    ];
+    for (k, v) in dirs {
+        pairs.push((k.to_string(), v));
+    }
+    for (k, v) in [
+        ("DOMAIN", "vpn.example.com"),
+        ("PUBLIC_BASE_URL", BASE),
+        // closed local port: IdP calls fail immediately, tests never touch the network
+        ("OIDC_ISSUER_URL", "https://127.0.0.1:9/realms/test"),
+        ("OIDC_CLIENT_ID", "vpn-control"),
+        ("OIDC_CLIENT_SECRET", "test-client-secret"),
+        ("PROVIDER", "fake"),
+        ("ROTATE_COOLDOWN_S", "120"),
+    ]
+    .iter()
+    .chain(extra.iter())
+    {
+        pairs.push(((*k).to_string(), (*v).to_string()));
+    }
+    let config = Config::from_pairs(pairs).unwrap();
+    let sub_token = config.sub_token.expose().clone();
+    let ingress_token = config.ingress_token.expose().clone();
+    let state = AppState::new(config, Arc::new(FakeProvider::new())).unwrap();
+    let router = vpn_control::http::router(state.clone());
+    TestApp {
+        state,
+        router,
+        sub_token,
+        ingress_token,
+        _state_dir: state_dir,
+        _static_dir: static_dir,
+    }
+}
+
+fn app() -> TestApp {
+    app_with(&[])
+}
+
+impl TestApp {
+    /// Create a session the same way the OIDC callback does. Returns (cookie, csrf token).
+    fn login(&self, roles: &[&str]) -> (String, String) {
+        let cookie = self
+            .state
+            .sessions
+            .create(SessionData {
+                sub: "user-1".into(),
+                username: "alice".into(),
+                email: Some("alice@example.com".into()),
+                roles: roles.iter().map(|r| (*r).to_string()).collect(),
+                id_token: None,
+            })
+            .unwrap();
+        let csrf = self
+            .state
+            .sessions
+            .get(&cookie)
+            .unwrap()
+            .csrf_token
+            .expose()
+            .clone();
+        (cookie, csrf)
+    }
+
+    async fn send(&self, req: Request<Body>) -> Response {
+        self.router.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn get(&self, uri: &str) -> Response {
+        self.send(request(Method::GET, uri).body(Body::empty()).unwrap())
+            .await
+    }
+}
+
+fn request(method: Method, uri: &str) -> axum::http::request::Builder {
+    let peer: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .extension(ConnectInfo(peer))
+}
+
+fn session_cookie(cookie: &str) -> String {
+    format!("__Host-vpncp_session={cookie}")
+}
+
+async fn body_string(resp: Response) -> String {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+async fn body_json(resp: Response) -> serde_json::Value {
+    serde_json::from_str(&body_string(resp).await).unwrap()
+}
+
+fn assert_security_headers(resp: &Response, what: &str) {
+    let h = resp.headers();
+    let expect = [
+        (
+            "strict-transport-security",
+            "max-age=63072000; includeSubDomains",
+        ),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        (
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        ),
+        (
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        ),
+    ];
+    for (name, value) in expect {
+        assert_eq!(
+            h.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "{what}: header {name}"
+        );
+    }
+    assert!(h.get(header::SERVER).is_none(), "{what}: Server header");
+    assert!(h.get("x-request-id").is_some(), "{what}: X-Request-Id");
+    assert!(
+        h.get("access-control-allow-origin").is_none(),
+        "{what}: no CORS"
+    );
+}
+
+#[tokio::test]
+async fn security_headers_on_every_kind_of_response() {
+    let app = app();
+    let cases = [
+        ("/", StatusCode::OK),
+        ("/healthz", StatusCode::OK),
+        ("/assets/app-abc123.js", StatusCode::OK),
+        ("/missing.js", StatusCode::NOT_FOUND),
+        ("/s/a/b", StatusCode::NOT_FOUND),
+        ("/api/status", StatusCode::UNAUTHORIZED),
+        ("/api/nonexistent", StatusCode::NOT_FOUND),
+        ("/auth/whatever", StatusCode::NOT_FOUND),
+    ];
+    for (uri, status) in cases {
+        let resp = app.get(uri).await;
+        assert_eq!(resp.status(), status, "{uri}");
+        assert_security_headers(&resp, uri);
+    }
+}
+
+#[tokio::test]
+async fn healthz_is_plain_ok() {
+    let app = app();
+    let resp = app.get("/healthz").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    assert_eq!(body_string(resp).await, "ok");
+}
+
+#[tokio::test]
+async fn api_requires_auth_and_is_not_cached() {
+    let app = app();
+    for uri in [
+        "/api/status",
+        "/api/me",
+        "/api/events",
+        "/api/subscription",
+        "/api/wireguard",
+    ] {
+        let resp = app.get(uri).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "unauthorized");
+        assert!(body["message"].is_string());
+    }
+    // unknown / garbage session cookie
+    let resp = app
+        .send(
+            request(Method::GET, "/api/status")
+                .header(header::COOKIE, "__Host-vpncp_session=bogus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // non-bearer Authorization header
+    let resp = app
+        .send(
+            request(Method::GET, "/api/status")
+                .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_without_role_is_forbidden() {
+    let app = app();
+    let (cookie, _) = app.login(&["something-else"]);
+    let resp = app
+        .send(
+            request(Method::GET, "/api/status")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["error"], "forbidden");
+}
+
+#[tokio::test]
+async fn me_and_status_with_session() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let resp = app
+        .send(
+            request(Method::GET, "/api/me")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me = body_json(resp).await;
+    assert_eq!(me["sub"], "user-1");
+    assert_eq!(me["username"], "alice");
+    assert_eq!(me["email"], "alice@example.com");
+    assert_eq!(me["roles"][0], "vpn-admin");
+    assert_eq!(me["csrf_token"], csrf.as_str());
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/status")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = body_json(resp).await;
+    assert_eq!(s["provider"], "fake");
+    assert_eq!(s["state"], "running");
+    assert_eq!(s["public_ip"], "203.0.113.10");
+    assert_eq!(s["cooldown_remaining_s"], 0);
+    assert!(s["last_rotation_at"].is_null());
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/subscription")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let sub = body_json(resp).await;
+    assert_eq!(sub["url"], format!("{BASE}/s/{}", app.sub_token));
+    assert_eq!(sub["links"].as_array().unwrap().len(), 3);
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/wireguard")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let wg = body_json(resp).await;
+    assert_eq!(wg["enabled"], false);
+    assert!(wg["ingress_public_key"].is_null());
+    assert_eq!(wg["ingress_address"], "10.66.0.2/32");
+}
+
+#[tokio::test]
+async fn cookie_mutation_requires_csrf_token_and_origin() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    // no CSRF header at all
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/start")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["error"], "csrf");
+
+    // right token, foreign origin
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/start")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, "https://evil.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["error"], "csrf");
+
+    // right token and origin
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/start")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(body_json(resp).await, serde_json::json!({"ok": true}));
+
+    // stop with Referer instead of Origin
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/stop")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::REFERER, format!("{BASE}/dashboard"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // the event log shows both operations, newest first
+    let resp = app
+        .send(
+            request(Method::GET, "/api/events?limit=10")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let events = body_json(resp).await;
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["action"], "stop");
+    assert_eq!(events[1]["action"], "start");
+    assert_eq!(events[0]["actor"], "alice");
+}
+
+#[tokio::test]
+async fn wrong_subscription_token_is_a_plain_404() {
+    let app = app();
+    let unknown = app.get("/definitely/not/here.txt").await;
+    let unknown_status = unknown.status();
+    let unknown_type = unknown.headers()[header::CONTENT_TYPE].clone();
+    let unknown_body = body_string(unknown).await;
+
+    let wrong = format!("/s/{}", "x".repeat(43));
+    let resp = app.get(&wrong).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), unknown_status);
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], unknown_type);
+    assert_eq!(body_string(resp).await, unknown_body);
+
+    let resp = app.get("/i/wrong-token/config.json").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_string(resp).await, unknown_body);
+
+    // the ingress token is not a subscription token and vice versa
+    let resp = app.get(&format!("/s/{}", app.ingress_token)).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app.get(&format!("/i/{}/config.json", app.sub_token)).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn subscription_returns_base64_with_three_links() {
+    let app = app();
+    let resp = app.get(&format!("/s/{}", app.sub_token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert!(
+        h[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    assert_eq!(h["profile-update-interval"], "1");
+    assert_eq!(h["profile-title"], "base64:dHJhdmVs");
+    assert_security_headers(&resp, "/s/<token>");
+    let body = body_string(resp).await;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .unwrap();
+    let text = String::from_utf8(decoded).unwrap();
+    let links: Vec<&str> = text.split('\n').collect();
+    assert_eq!(links.len(), 3);
+    assert!(links[0].starts_with("vless://"));
+    assert!(links[1].starts_with("hysteria2://"));
+    assert!(links[2].starts_with("ss://"));
+    for l in &links {
+        assert!(l.contains("@203.0.113.10:"), "{l}");
+    }
+}
+
+#[tokio::test]
+async fn subscription_is_503_without_public_ip() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/stop")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let resp = app.get(&format!("/s/{}", app.sub_token)).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/subscription")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(body_json(resp).await["links"].is_null());
+}
+
+#[tokio::test]
+async fn ingress_config_with_right_token() {
+    let app = app();
+    let resp = app
+        .get(&format!("/i/{}/config.json", app.ingress_token))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+    let cfg = body_json(resp).await;
+    assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 3);
+    assert_eq!(cfg["route"]["final"], "direct");
+}
+
+#[tokio::test]
+async fn repeated_wrong_tokens_trigger_the_failure_limiter() {
+    let app = app();
+    for _ in 0..10 {
+        let resp = app.get("/s/wrong-token-wrong-token-wrong-token-xx").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    // now even the right token is refused from this IP
+    let resp = app.get(&format!("/s/{}", app.sub_token)).await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = resp.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry > 500);
+}
+
+#[tokio::test]
+async fn malformed_bearer_is_401_and_a_failure_even_when_idp_is_down() {
+    // The IdP (closed local port) is unreachable, but structurally invalid tokens are rejected
+    // offline: 401, never 503, and each one counts for the failure limiter.
+    let app = app();
+    for _ in 0..10 {
+        let resp = app
+            .send(
+                request(Method::GET, "/api/me")
+                    .header(header::AUTHORIZATION, "Bearer abc.def.ghi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let resp = app.get("/api/me").await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn token_endpoints_are_rate_limited() {
+    let app = app();
+    let mut limited = false;
+    for _ in 0..40 {
+        let resp = app.get(&format!("/s/{}", app.sub_token)).await;
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+            limited = true;
+            break;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert!(limited, "30/min limit not enforced");
+}
+
+async fn rotate(app: &TestApp, cookie: &str, csrf: &str, body: &str) -> Response {
+    app.send(
+        request(Method::POST, "/api/ingress/rotate")
+            .header(header::COOKIE, session_cookie(cookie))
+            .header("x-csrf-token", csrf)
+            .header(header::ORIGIN, BASE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn rotate_then_cooldown() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    let resp = rotate(
+        &app,
+        &cookie,
+        &csrf,
+        r#"{"reason":"blocked in hotel wifi"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ip = body_json(resp).await["public_ip"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(ip, "203.0.113.10");
+    assert!(ip.starts_with("203.0.113."));
+
+    let resp = rotate(&app, &cookie, &csrf, "{}").await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_header: u64 = resp.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["error"], "cooldown");
+    let retry_body = body["retry_after_s"].as_u64().unwrap();
+    assert!(retry_body > 0 && retry_body <= 120);
+    assert_eq!(retry_header, retry_body);
+
+    // the status reflects the rotation
+    let resp = app
+        .send(
+            request(Method::GET, "/api/status")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let s = body_json(resp).await;
+    assert_eq!(s["public_ip"], ip.as_str());
+    assert!(s["cooldown_remaining_s"].as_u64().unwrap() > 0);
+    assert!(s["last_rotation_at"].as_i64().is_some());
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/events")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let events = body_json(resp).await;
+    assert_eq!(events[0]["action"], "rotate");
+    assert_eq!(events[0]["detail"], "blocked in hotel wifi");
+    assert_eq!(events[0]["ip"], ip.as_str());
+}
+
+#[tokio::test]
+async fn rotate_validates_the_body() {
+    let app = app_with(&[("ROTATE_COOLDOWN_S", "0")]);
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    for bad in [
+        r#"{"reason":"x","extra":1}"#,
+        r#"{"reason":5}"#,
+        "not json",
+        &format!(r#"{{"reason":"{}"}}"#, "a".repeat(201)),
+    ] {
+        let resp = rotate(&app, &cookie, &csrf, bad).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(body_json(resp).await["error"], "bad_request");
+    }
+    // empty body is fine
+    let resp = rotate(&app, &cookie, &csrf, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oversized_bodies_are_rejected() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let big = format!(r#"{{"reason":"{}"}}"#, "a".repeat(20 * 1024));
+    let resp = rotate(&app, &cookie, &csrf, &big).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_security_headers(&resp, "413");
+    assert_eq!(body_json(resp).await["error"], "bad_request");
+
+    // declared Content-Length over the limit is rejected before authentication even runs
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/start")
+                .header(header::CONTENT_LENGTH, big.len())
+                .body(Body::from(big.clone()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(resp).await["error"], "bad_request");
+}
+
+#[tokio::test]
+async fn api_paths_never_fall_back_to_index_html() {
+    let app = app();
+    for uri in [
+        "/api/nonexistent",
+        "/api",
+        "/api/",
+        "/api/ingress",
+        "/auth",
+        "/auth/",
+        "/s",
+        "/s/",
+        "/i",
+        "/i/x",
+        "/i/x/other.json",
+    ] {
+        let resp = app.get(uri).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("<title>spa</title>"),
+            "{uri} served index.html"
+        );
+    }
+    let resp = app.get("/api/nonexistent").await;
+    assert_eq!(body_json(resp).await["error"], "not_found");
+}
+
+#[tokio::test]
+async fn spa_routes_fall_back_to_index_html() {
+    let app = app();
+    for uri in ["/", "/dashboard", "/settings/profile?x=1"] {
+        let resp = app.get(uri).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert!(
+            resp.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(body_string(resp).await, INDEX_HTML);
+    }
+    let resp = app.get("/assets/app-abc123.js").await;
+    assert_eq!(
+        resp.headers()[header::CACHE_CONTROL],
+        "public, max-age=31536000, immutable"
+    );
+    // path traversal is not possible
+    let resp = app.get("/../Cargo.toml").await;
+    assert!(!body_string(resp).await.contains("[package]"));
+    let resp = app.get("/assets/..%2f..%2fCargo.toml").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // non-GET to the SPA is a plain 404
+    let resp = app
+        .send(
+            request(Method::POST, "/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn login_redirects_with_error_when_idp_is_unreachable() {
+    let app = app();
+    let resp = app.get("/auth/login?return_to=/dashboard").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()[header::LOCATION],
+        format!("{BASE}/?login_error=unavailable").as_str()
+    );
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn callback_without_pending_login_is_invalid() {
+    let app = app();
+    let resp = app.get("/auth/callback?code=abc&state=def").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()[header::LOCATION],
+        format!("{BASE}/?login_error=invalid").as_str()
+    );
+}
+
+#[tokio::test]
+async fn logout_requires_csrf_and_destroys_the_session() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let resp = app
+        .send(
+            request(Method::POST, "/auth/logout")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(app.state.sessions.get(&cookie).is_some());
+
+    let resp = app
+        .send(
+            request(Method::POST, "/auth/logout")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let set_cookie = resp.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with("__Host-vpncp_session=;"));
+    assert!(set_cookie.contains("Max-Age=0"));
+    // IdP unreachable → falls back to the app's home page
+    assert_eq!(
+        body_json(resp).await["logout_url"],
+        format!("{BASE}/").as_str()
+    );
+    assert!(app.state.sessions.get(&cookie).is_none());
+
+    let resp = app
+        .send(
+            request(Method::GET, "/api/me")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn trusted_proxy_header_selects_the_client_ip() {
+    let app = app_with(&[("TRUST_PROXY_HEADERS", "true")]);
+    // Ten failures from one forwarded client block that client only.
+    for _ in 0..10 {
+        let resp = app
+            .send(
+                request(Method::GET, "/s/wrong-token-wrong-token-wrong-token-yy")
+                    .header("x-forwarded-for", "198.51.100.1, 203.0.113.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    let blocked = app
+        .send(
+            request(Method::GET, &format!("/s/{}", app.sub_token))
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let other = app
+        .send(
+            request(Method::GET, &format!("/s/{}", app.sub_token))
+                .header("x-forwarded-for", "203.0.113.100")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(other.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn method_not_allowed_on_api_is_json() {
+    let app = app();
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_security_headers(&resp, "405");
+    assert_eq!(body_json(resp).await["error"], "bad_request");
+}

@@ -1,0 +1,76 @@
+[package]
+name = "vpn-control"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Control plane for a disposable sing-box ingress on AWS (Lightsail / EC2)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "vpn-control"
+path = "src/main.rs"
+
+[lib]
+name = "vpn_control"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+aws-config = { version = "1.13.0", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-sdk-ec2 = { version = "1.274.0", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+aws-sdk-lightsail = { version = "1.135.0", default-features = false, features = ["rt-tokio", "default-https-client", "behavior-version-latest"] }
+axum = "0.8"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+http-body-util = "0.1.5"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
+pem = "4.0.0"
+percent-encoding = "2.3.2"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs"] }
+tower = { version = "0.5.3", features = ["util", "limit", "timeout"] }
+tower-http = { version = "0.7.1", features = ["fs", "limit", "catch-panic"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.29.0", features = ["v4"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# The AWS SDK crates are very large; keep debug builds small.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false

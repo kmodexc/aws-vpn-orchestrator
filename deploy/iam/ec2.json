@@ -1,0 +1,102 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeNoResourceScopingPossible",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeAddresses"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "StartStopTheIngressInstanceOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances"
+      ],
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/<INSTANCE_ID>"
+    },
+    {
+      "Sid": "AllocateOnlyTaggedElasticIps",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AllocateAddress"
+      ],
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:elastic-ip/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/vpn-orchestrator": "managed"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "vpn-orchestrator"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "TagOnlyWhileAllocating",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:elastic-ip/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "AllocateAddress",
+          "aws:RequestTag/vpn-orchestrator": "managed"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "vpn-orchestrator"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "AssociateOnlyManagedElasticIps",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AssociateAddress"
+      ],
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:elastic-ip/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/vpn-orchestrator": "managed"
+        }
+      }
+    },
+    {
+      "Sid": "AssociateToTheIngressInstanceOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AssociateAddress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:instance/<INSTANCE_ID>",
+        "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:network-interface/*"
+      ]
+    },
+    {
+      "Sid": "ReleaseOnlyManagedElasticIps",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": "arn:aws:ec2:<REGION>:<ACCOUNT_ID>:elastic-ip/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/vpn-orchestrator": "managed"
+        }
+      }
+    }
+  ]
+}
