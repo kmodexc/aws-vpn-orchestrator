@@ -85,7 +85,8 @@ pub fn server_config_with(cfg: &Config, s: &ProtocolSettings, log_level: &str) -
         }));
     }
     let mut config = json!({
-        "log": {"level": log_level, "timestamp": true},
+        // No ANSI colours: the lines are shipped to the dashboard as text.
+        "log": {"level": log_level, "timestamp": true, "disable_color": true},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
@@ -276,6 +277,7 @@ mod tests {
         let c = server_config(&cfg, &defaults(&cfg));
         assert_eq!(c["route"]["final"], "direct");
         assert_eq!(c["log"]["level"], "warn");
+        assert_eq!(c["log"]["disable_color"], true);
         let rules = c["route"]["rules"].as_array().unwrap();
         assert_eq!(rules[0]["action"], "resolve");
         assert_eq!(rules[1]["ip_is_private"], true);

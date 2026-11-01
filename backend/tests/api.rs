@@ -1346,7 +1346,7 @@ async fn ingress_reports_feed_telemetry_and_logs() {
     assert_eq!(t["report"]["log_lines"], 2);
 
     let l = body_json(app.get_with_session("/api/ingress/logs", &cookie).await).await;
-    assert_eq!(l["lines"][0]["text"], "first [31mline[0m");
+    assert_eq!(l["lines"][0]["text"], "first line");
     assert_eq!(l["lines"][1]["seq"], 1);
     assert_eq!(l["next"], 2);
     assert!(l["epoch"].is_u64());

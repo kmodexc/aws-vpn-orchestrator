@@ -286,7 +286,7 @@ AWS errors are logged with full detail server-side and surface to clients as `un
 
 The ingress pulls it on boot, every 10 minutes, and at once when a report reply says the config
 is stale (§5a). `log.level` is `warn` unless a debug level is active (§5a); `log.timestamp` is
-on. `experimental.clash_api` is always present: `external_controller = "127.0.0.1:9090"` with
+on, `log.disable_color` is on (lines are shipped to the dashboard as text). `experimental.clash_api` is always present: `external_controller = "127.0.0.1:9090"` with
 the derived secret, so the reporter can read connection and traffic counters — loopback only,
 never exposed. `route.rules` = `[{"action": "resolve"}, {"ip_is_private": true, "action": "reject"}]`:
 proxied connections to loopback, private and link-local destinations are refused, so a VPN user

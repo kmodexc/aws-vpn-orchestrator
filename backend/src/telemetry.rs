@@ -127,14 +127,47 @@ impl Default for Telemetry {
     }
 }
 
-/// Keep a journal line printable and bounded. Control characters (incl. ANSI escapes) are
-/// removed, not escaped, so nothing can mess with the log view or a terminal.
+/// Keep a journal line printable and bounded. ANSI escape sequences (colours `ESC [ … m`, OSC
+/// strings) are removed whole and other control characters dropped, so nothing can mess with the
+/// log view or a terminal. sing-box is also asked not to colour its output (`disable_color`), but
+/// journal lines from other units may still carry escapes.
 pub fn sanitize_line(line: &str) -> String {
-    let mut out: String = line
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\t')
-        .map(|c| if c == '\t' { ' ' } else { c })
-        .collect();
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                // CSI: ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final 0x40-0x7E>
+                Some('[') => {
+                    chars.next();
+                    for d in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] … terminated by BEL or ESC \
+                Some(']') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for d in chars.by_ref() {
+                        if d == '\x07' || (prev == '\x1b' && d == '\\') {
+                            break;
+                        }
+                        prev = d;
+                    }
+                }
+                // Two-character escapes (ESC c, ESC =, …): drop the pair.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
     if out.chars().count() > MAX_LINE_CHARS {
         out = out.chars().take(MAX_LINE_CHARS).collect();
         out.push('…');
@@ -378,7 +411,7 @@ mod tests {
         );
         let c = t.chunk_at(0, 10, 1);
         assert_eq!(c.lines.len(), 2);
-        assert_eq!(c.lines[0].text, "a[31mred[0m");
+        assert_eq!(c.lines[0].text, "ared");
         assert_eq!(c.lines[1].text, "b c");
         assert_eq!(c.lines[1].seq, 1);
         assert_eq!(c.next, 2);
@@ -440,6 +473,27 @@ mod tests {
         // lines arriving after the purge are kept again
         t.record_at(report(None, None, vec!["y".into()]), 300);
         assert_eq!(t.chunk_at(0, 10, 300).lines[0].text, "y");
+    }
+
+    #[test]
+    fn ansi_sequences_are_removed_whole() {
+        // sing-box's own colouring: 16-colour, 256-colour, reset, around a bracketed id
+        assert_eq!(
+            sanitize_line("+0000 \x1b[36mINFO\x1b[0m [\x1b[38;5;105m1928943449\x1b[0m 19ms] ok"),
+            "+0000 INFO [1928943449 19ms] ok"
+        );
+        assert_eq!(sanitize_line("\x1b[1;31mE\x1b[0m"), "E");
+        // OSC hyperlink with BEL and with ST terminators
+        assert_eq!(
+            sanitize_line("a\x1b]8;;http://x\x07b\x1b]8;;\x1b\\c"),
+            "abc"
+        );
+        // two-character escape and a bare trailing ESC
+        assert_eq!(sanitize_line("x\x1bcy\x1b"), "xy");
+        // an unterminated CSI eats the rest instead of leaking half a sequence
+        assert_eq!(sanitize_line("ok\x1b[38;5"), "ok");
+        // other control characters vanish, tabs become spaces
+        assert_eq!(sanitize_line("a\x00b\rc\td"), "abc d");
     }
 
     #[test]
