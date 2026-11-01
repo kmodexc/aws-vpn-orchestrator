@@ -2,19 +2,20 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadAndPowerTheIngressInstanceOnly",
+      "Sid": "PowerTheIngressInstanceOnly",
       "Effect": "Allow",
       "Action": [
-        "lightsail:GetInstance",
         "lightsail:StartInstance",
         "lightsail:StopInstance"
       ],
       "Resource": "arn:aws:lightsail:<REGION>:<ACCOUNT_ID>:Instance/<INSTANCE_RESOURCE_ID>"
     },
     {
-      "Sid": "ListAndAllocateStaticIpsNoResourceScopingPossible",
+      "Sid": "ReadAndAllocateNoResourceScopingPossible",
       "Effect": "Allow",
       "Action": [
+        "lightsail:GetInstance",
+        "lightsail:GetStaticIp",
         "lightsail:GetStaticIps",
         "lightsail:AllocateStaticIp"
       ],
@@ -29,7 +30,6 @@
       "Sid": "ManageStaticIpsInThisRegion",
       "Effect": "Allow",
       "Action": [
-        "lightsail:GetStaticIp",
         "lightsail:DetachStaticIp",
         "lightsail:ReleaseStaticIp"
       ],

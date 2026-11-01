@@ -589,6 +589,11 @@ p {
   color: var(--error-text);
 }
 
+.tag--settings {
+  background: var(--notice-bg);
+  color: var(--notice-text);
+}
+
 /* ---------- dialog ---------- */
 
 .dialog {
@@ -645,6 +650,45 @@ p {
   font-size: 0.8rem;
   color: var(--muted);
   text-align: right;
+}
+
+/* ---------- settings ---------- */
+
+.settings {
+  display: grid;
+  gap: 14px;
+}
+
+.settings .field__hint {
+  text-align: left;
+}
+
+.check {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  align-items: start;
+}
+
+.check input {
+  width: 20px;
+  height: 20px;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+}
+
+.check label {
+  font-weight: 600;
+}
+
+.check .field__hint {
+  grid-column: 2;
+}
+
+.settings__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 @media (prefers-reduced-motion: reduce) {

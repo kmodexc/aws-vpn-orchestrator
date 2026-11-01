@@ -35,7 +35,8 @@ pub async fn subscription(
     let Some(public_ip) = status.public_ip else {
         return plain_status(StatusCode::SERVICE_UNAVAILABLE, "Ingress has no public IP");
     };
-    let body = singbox::subscription_body(cfg, public_ip);
+    let settings = state.protocol_settings().await;
+    let body = singbox::subscription_body(cfg, &settings, public_ip);
     let mut resp = (StatusCode::OK, body).into_response();
     let h = resp.headers_mut();
     h.insert(
@@ -68,7 +69,8 @@ pub async fn ingress_config(
         tracing::info!("ingress config request with wrong token");
         return plain_not_found();
     }
-    let mut resp = Json(singbox::server_config(cfg)).into_response();
+    let settings = state.protocol_settings().await;
+    let mut resp = Json(singbox::server_config(cfg, &settings)).into_response();
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp

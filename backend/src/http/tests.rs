@@ -76,7 +76,7 @@ impl Harness {
             req = req.header(header::AUTHORIZATION, a);
         }
         if let Some(c) = cookie {
-            req = req.header(header::COOKIE, format!("__Host-vpncp_session={c}"));
+            req = req.header(header::COOKIE, format!("__Host-sid={c}"));
         }
         if let Some(ct) = content_type {
             req = req.header(header::CONTENT_TYPE, ct);
@@ -265,7 +265,7 @@ async fn start_login(h: &Harness) -> (String, url::Url) {
         assert!(set_cookie.contains(attr), "{attr}");
     }
     let login_cookie = set_cookie
-        .strip_prefix("__Host-vpncp_login=")
+        .strip_prefix("__Host-login=")
         .unwrap()
         .split(';')
         .next()
@@ -279,7 +279,7 @@ async fn callback(h: &Harness, login_cookie: &str, query: &str) -> Response {
     let req = Request::builder()
         .uri(format!("/auth/callback?{query}"))
         .extension(ConnectInfo(peer))
-        .header(header::COOKIE, format!("__Host-vpncp_login={login_cookie}"))
+        .header(header::COOKIE, format!("__Host-login={login_cookie}"))
         .body(Body::empty())
         .unwrap();
     super::router(h.state.clone()).oneshot(req).await.unwrap()
@@ -342,7 +342,7 @@ async fn callback_maps_idp_errors_and_unreachable_token_endpoint() {
         "https://vpn.example.com/?login_error=denied"
     );
     let clear = resp.headers()[header::SET_COOKIE].to_str().unwrap();
-    assert!(clear.starts_with("__Host-vpncp_login=;") && clear.contains("Max-Age=0"));
+    assert!(clear.starts_with("__Host-login=;") && clear.contains("Max-Age=0"));
 
     let (cookie, url) = start_login(&h).await;
     let state: String = url
@@ -403,7 +403,7 @@ async fn logout_returns_end_session_url() {
         .method(Method::POST)
         .uri("/auth/logout")
         .extension(ConnectInfo(peer))
-        .header(header::COOKIE, format!("__Host-vpncp_session={cookie}"))
+        .header(header::COOKIE, format!("__Host-sid={cookie}"))
         .header("x-csrf-token", csrf)
         .header(header::ORIGIN, "https://vpn.example.com")
         .body(Body::empty())

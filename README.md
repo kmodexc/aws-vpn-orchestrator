@@ -222,7 +222,8 @@ Scoping notes:
 - **Lightsail** static IPs are addressed by a random resource UUID, are not taggable, and
   `GetStaticIps` / `AllocateStaticIp` support no resource scoping at all. Static-IP actions are
   therefore limited to the region (`StaticIp/*`); the backend itself only ever releases IPs whose
-  name starts with `vpn-orchestrator-`. Instance actions are pinned to the one instance.
+  name starts with `vpn-orchestrator-`. Start/stop and attach are pinned to the one instance; the
+  read calls (`GetInstance`, `GetStaticIp`) support no resource scoping and are region-wide.
   ⇒ Do not keep other static IPs you care about in the same account/region.
 - **EC2**: `Describe*` cannot be scoped. Start/stop is pinned to one instance; new Elastic IPs can
   only be created *with* the tag `vpn-orchestrator=managed`; only tagged EIPs can be associated
@@ -316,6 +317,19 @@ every push to `main` and every `v*` tag, and published to GitHub Container Regis
 The server only pulls; it never compiles. (The Rust build needs more than 3 GB RAM — on a small
 VPS that starves the host.) The image contains no secrets: everything comes from `.env` at runtime.
 
+**Private repository / private image.** If the repository (and the package under *Packages →
+aws-vpn-orchestrator → Package settings*) is private, the server has to log in to GHCR once with a
+read-only token: GitHub → *Settings → Developer settings → Personal access tokens (classic)* → a
+token with only the `read:packages` scope, then on the server
+
+```bash
+docker login ghcr.io -u <github-user>     # paste the token as password; stored in ~/.docker/config.json
+docker compose pull
+```
+
+The attestation step below only runs while the repository is public (GitHub offers artifact
+attestations for private repositories only on Enterprise Cloud).
+
 Each pushed image carries a signed build-provenance attestation. To check that an image was built
 by this repository's workflow before deploying it:
 
@@ -330,6 +344,30 @@ little RAM, limit Cargo to one job and cap the builder, so a failing build canno
 docker buildx create --name lowmem --driver docker-container --driver-opt memory=3g --driver-opt memory-swap=3g
 CARGO_BUILD_JOBS=1 BUILDX_BUILDER=lowmem docker compose build
 ```
+
+### Protocol settings at runtime
+
+The dashboard's **Protocol settings** card (API: `GET/PUT/DELETE /api/settings`) changes, without a
+restart:
+
+| Setting | Effect |
+|---|---|
+| REALITY camouflage target (`reality_sni`) | the TLS site VLESS-REALITY impersonates; pick a real TLS 1.3 site that is reachable, and not blocked, where you are |
+| Hysteria2 on/off, server name, **Salamander** obfuscation | Salamander makes the UDP packets stop looking like QUIC (needs a client that supports it, e.g. Hiddify) |
+| Shadowsocks on/off | Shadowsocks is easy to detect as fully encrypted traffic; where censorship is strong, keep it off |
+
+`.env` (`REALITY_SNI`, `HY2_SNI`, `HY2_ENABLED`, `HY2_OBFS`, `SS_ENABLED`) provides the defaults;
+a change in the UI overrides them until *Reset to .env*. The ingress picks a change up within
+10 minutes (it pulls its config on a timer); clients pick it up on their next subscription
+refresh. VLESS-REALITY is always on. Ports stay in `.env`, because changing one also needs the
+Lightsail firewall and the ingress' ufw. Every change is recorded in the event log.
+
+### What anonymous visitors see
+
+Nothing of the app. Without a session, every page redirects to the Keycloak sign-in, every file
+(`/assets/*`, `/favicon.svg`, …) is a plain 404, and every `/api/*` path answers the same 401,
+whether it exists or not. The page title and icon are a neutral "Console". To keep the sign-in
+itself neutral, see [docs/keycloak.md → Keep the sign-in neutral](docs/keycloak.md#keep-the-sign-in-neutral).
 
 ### Reproducible images
 

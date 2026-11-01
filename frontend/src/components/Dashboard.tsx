@@ -11,6 +11,7 @@ import {
 import { useCountdown, useNow, usePageVisible } from "../hooks";
 import { cooldownDeadline, FAST_POLL_MS, pollInterval, SLOW_POLL_MS } from "../time";
 import { EventLog } from "./EventLog";
+import { SettingsCard } from "./SettingsCard";
 import { StatusCard, type Action } from "./StatusCard";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { WireGuardCard } from "./WireGuardCard";
@@ -167,7 +168,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
       <header className="topbar">
         <div className="topbar__brand">
           <span className="logo" aria-hidden="true" />
-          <span>VPN Control</span>
+          <span>Console</span>
         </div>
         <div className="topbar__user">
           <span className="topbar__name" title={me.email ?? undefined}>
@@ -202,6 +203,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
           onRefresh={manualRefresh}
         />
         <SubscriptionCard api={api} ipKey={status?.public_ip ?? null} />
+        <SettingsCard api={api} onSaved={manualRefresh} />
         {wg?.enabled === true && <WireGuardCard wg={wg} />}
         <EventLog events={events} error={eventsError} now={slowNow} />
       </main>

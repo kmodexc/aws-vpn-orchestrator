@@ -91,6 +91,7 @@ The backend binary `vpn-control` has these subcommands (no subcommand = `serve`)
 | `REALITY_SNI` | no | `www.microsoft.com` | |
 | `HY2_SNI` | no | `www.bing.com` | |
 | `VLESS_PORT` / `HY2_PORT` / `SS_PORT` | no | `443` / `443` / `8443` | `SS_PORT` must differ from `VLESS_PORT` (both TCP); HY2 is UDP and may share 443 |
+| `HY2_ENABLED` / `HY2_OBFS` / `SS_ENABLED` | no | `true` / `false` / `true` | defaults of the runtime protocol settings (§5 `/api/settings`) |
 | `VLESS_UUID` | yes | – | secret |
 | `REALITY_PRIVATE_KEY` | yes | – | secret, x25519, base64url no padding |
 | `REALITY_PUBLIC_KEY` | yes | – | must match the private key (checked at startup) |
@@ -122,7 +123,7 @@ Tokens never reach the browser. The backend runs the Authorization Code flow wit
 
 - `GET /auth/login?return_to=<path>`: creates a pending login (state, nonce, PKCE verifier,
   sanitized return_to, 10-minute TTL) stored server-side under a random id. It sets the cookie
-  `__Host-vpncp_login` (HttpOnly, Secure, SameSite=Lax, Path=/, Max-Age=600) and answers 302 to the
+  `__Host-login` (HttpOnly, Secure, SameSite=Lax, Path=/, Max-Age=600) and answers 302 to the
   authorization endpoint. `return_to` must be a same-origin relative path that starts with a single
   `/` (no `//`, no `\`, no scheme); otherwise `/`.
 - `GET /auth/callback?code&state`: the login cookie must exist and its pending login's `state`
@@ -135,7 +136,7 @@ Tokens never reach the browser. The backend runs the Authorization Code flow wit
   the session, sets the session cookie, clears the login cookie and redirects 302 to return_to. On
   failure it redirects 302 to `/?login_error=<code>`, where code is one of `denied`, `invalid`,
   `forbidden`, `unavailable`, with no details.
-- Session cookie `__Host-vpncp_session`: HttpOnly, Secure, SameSite=Lax, Path=/, no Domain. Value
+- Session cookie `__Host-sid`: HttpOnly, Secure, SameSite=Lax, Path=/, no Domain. Value
   is 256 bits from a CSPRNG, base64url. Sessions are stored **server-side in memory**, keyed by the
   SHA-256 of the cookie value. A session holds sub, username, email, roles, csrf_token,
   id_token (for logout), created_at and last_seen. It enforces the idle and absolute timeouts. A
@@ -189,6 +190,8 @@ the request id in header `X-Request-Id`; every response carries a fresh server-g
 wrong method on an `/api` route is `405`, an oversized body `413`; both use code `bad_request`.
 A non-empty request body must be `Content-Type: application/json` and a JSON object (an array is
 `400`). `POST /api/ingress/start` and `/stop` accept only an empty body or `{}`.
+Without valid credentials every `/api/*` request — existing route or not, any method — is `401
+unauthorized`, so the routes cannot be enumerated anonymously.
 
 | Method & path | Auth | Response |
 |---|---|---|
@@ -198,13 +201,16 @@ A non-empty request body must be `Content-Type: application/json` and a JSON obj
 | `POST /api/ingress/start` | yes + CSRF | `202 {"ok": true}` |
 | `POST /api/ingress/stop` | yes + CSRF | `202 {"ok": true}` |
 | `POST /api/ingress/rotate` | yes + CSRF | body `{"reason"?: string ≤ 200 chars}` → `200 {"public_ip": "…"}`; `429 {"error":"cooldown","message", "retry_after_s": int}` + `Retry-After`; `409 conflict` if another operation is running |
-| `GET /api/events?limit=N` | yes | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
+| `GET /api/events?limit=N` | yes | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"settings"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
 | `GET /api/subscription` | yes | `{ "url": "<PUBLIC_BASE_URL>/s/<SUB_TOKEN>", "links": [string, …] \| null }` (links null when there is no public IP) |
 | `GET /api/wireguard` | yes | `{ "enabled": bool, "ingress_public_key": string\|null, "ingress_address": string, "vps_peer_snippet": string\|null }` |
+| `GET /api/settings` | yes | `{ "settings": P, "defaults": P, "overridden": bool, "ports": { "vless_tcp", "hy2_udp", "ss" } }` with P = `{ "reality_sni", "hy2_sni", "hysteria2": bool, "hy2_obfs": bool, "shadowsocks": bool }`; `settings` = in effect, `defaults` = from `.env` |
+| `PUT /api/settings` | yes + CSRF | body: a complete P (no unknown fields); SNIs must be public DNS names (≥ 2 labels, alphabetic TLD) → same response as GET; stored in `state.json` and logged as a `settings` event |
+| `DELETE /api/settings` | yes + CSRF | drop the override (back to `.env`) → same response as GET; logged |
 | `GET /s/{token}` | path token | `200 text/plain` base64 subscription; headers `profile-update-interval: <SUB_UPDATE_HOURS>`, `profile-title: base64:<b64(PROFILE_NAME)>`, `Cache-Control: no-store`; `503` if the ingress has no public IP |
 | `GET /i/{token}/config.json` | path token | `200 application/json` sing-box server config |
 | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout` | see §4 | |
-| any other GET | none | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404 |
+| any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `302` to `/auth/login` (`?return_to=` unless `/`), any file is a plain 404, and `/?login_error=<code>` gets a minimal neutral HTML page (no redirect, so a failing SSO login cannot loop). The site therefore shows nothing but the IdP login to anyone not signed in. |
 
 Only one start/stop/rotate runs at a time (a mutex; if busy → 409). Rotation: refuse while in
 cooldown. Remember the old IP as "burned". If AWS returns an IP that is burned or equal to the
@@ -242,6 +248,12 @@ AWS errors are logged with full detail server-side and surface to clients as `un
 
 ## 7. sing-box server config (`/i/{token}/config.json`) — target sing-box ≥ 1.12
 
+The ingress pulls it on boot and every 10 minutes. `REALITY_SNI`, `HY2_SNI` and which inbounds
+exist come from the effective protocol settings (§5 `/api/settings`): the VLESS inbound always
+exists; the Hysteria2 inbound only with `hysteria2`, and with `hy2_obfs` it gets
+`"obfs": {"type": "salamander", "password": <b64url(sha256("hysteria2-salamander\0" + HY2_PASSWORD))>}`;
+the Shadowsocks inbound only with `shadowsocks`.
+
 ```json
 {
   "log": {"level": "warn"},
@@ -276,11 +288,14 @@ and set `route.final = "wg-exit"`.
 - `hysteria2://<HY2_PASSWORD>@<ip>:<HY2_PORT>?sni=<HY2_SNI>&insecure=1&pinSHA256=<hex sha256 of cert DER>#<NAME>-hy2`
 - `ss://<urlencode("2022-blake3-aes-128-gcm:" + SS_PASSWORD)>@<ip>:<SS_PORT>#<NAME>-ss`
 
-IPv6 public addresses are never published.
+Only enabled protocols are listed (§7). With `hy2_obfs` the Hysteria2 link carries
+`&obfs=salamander&obfs-password=<salamander password>` before the fragment. IPv6 public addresses
+are never published.
 
 ## 9. Persistent state
 
-`STATE_DIR/state.json` holds `{ events: [... max 500], burned_ips: [... max 500], last_rotation_at }`.
+`STATE_DIR/state.json` holds `{ events: [... max 500], burned_ips: [... max 500], last_rotation_at, protocol }`
+(`protocol`: the `/api/settings` override or absent).
 Writes are atomic (temp file + rename) with file mode 0600. It holds no secrets.
 
 ## 10. Security requirements (non-negotiable)
@@ -304,8 +319,8 @@ Writes are atomic (temp file + rename) with file mode 0600. It holds no secrets.
   path token, an invalid Bearer token, and a callback with a bad `state`/`iss`/token (not a
   missing role, a user-cancelled login or an expired session cookie). While blocked, all
   `/auth`, `/s`, `/i` and `/api` requests from that client get 429 with `Retry-After`.
-- Static files: `/assets/*` (content-hashed by Vite) get
-  `Cache-Control: public, max-age=31536000, immutable`; everything else from `STATIC_DIR`
+- Static files are served only with a valid session (§5). `/assets/*` (content-hashed by Vite) get
+  `Cache-Control: private, max-age=31536000, immutable`; everything else from `STATIC_DIR`
   (including `index.html`) gets `no-cache`. A missing path with a file extension, or under
   `/assets/`, is a plain 404 instead of `index.html`.
 - Request timeout 30 s (rotate may take longer: 90 s) and body limit 16 KiB. Graceful shutdown on

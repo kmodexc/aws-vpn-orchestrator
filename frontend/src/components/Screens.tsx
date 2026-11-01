@@ -9,7 +9,7 @@ function Center({ children, labelledBy }: CenterProps) {
       <section className="card card--narrow" aria-labelledby={labelledBy}>
         <div className="brand">
           <span className="logo" aria-hidden="true" />
-          <span>VPN Control</span>
+          <span>Console</span>
         </div>
         {children}
       </section>
@@ -41,7 +41,7 @@ export function LoginScreen({ message, onSignIn }: LoginProps) {
       <h1 id="login-title" className="screen-title">
         Sign in
       </h1>
-      <p className="muted">Sign in with your kmode.dev account to manage the VPN.</p>
+      <p className="muted">Sign in to continue.</p>
       <div role="alert" aria-live="assertive">
         {message !== null && <p className="error">{message}</p>}
       </div>

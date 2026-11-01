@@ -13,6 +13,7 @@ pub mod http;
 pub mod orchestrator;
 pub mod providers;
 pub mod secret;
+pub mod settings;
 pub mod singbox;
 pub mod state;
 pub mod util;

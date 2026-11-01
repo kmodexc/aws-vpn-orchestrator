@@ -76,6 +76,12 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(api::events))
         .route("/subscription", get(api::subscription))
         .route("/wireguard", get(api::wireguard))
+        .route(
+            "/settings",
+            get(api::get_settings)
+                .put(api::put_settings)
+                .delete(api::reset_settings),
+        )
         .fallback(api::not_found)
         .method_not_allowed_fallback(api::method_not_allowed);
 

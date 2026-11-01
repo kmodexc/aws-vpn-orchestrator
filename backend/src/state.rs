@@ -1,4 +1,5 @@
-//! Persistent state in `STATE_DIR/state.json`: event log, burned IPs, last rotation time.
+//! Persistent state in `STATE_DIR/state.json`: event log, burned IPs, last rotation time,
+//! runtime protocol settings.
 //! Holds no secrets. Writes are atomic (temp file + rename) with mode 0600 on unix.
 
 use std::io::Write;
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use crate::settings::ProtocolSettings;
 use crate::util::{random_bytes, unix_now};
 
 pub const MAX_EVENTS: usize = 500;
@@ -19,6 +21,7 @@ pub enum EventAction {
     Start,
     Stop,
     Rotate,
+    Settings,
     Error,
 }
 
@@ -39,6 +42,9 @@ pub struct PersistedState {
     pub burned_ips: Vec<String>,
     #[serde(default)]
     pub last_rotation_at: Option<i64>,
+    /// Override of the `.env` protocol defaults (`/api/settings`); `None` = use `.env`.
+    #[serde(default)]
+    pub protocol: Option<ProtocolSettings>,
 }
 
 impl PersistedState {

@@ -12,6 +12,7 @@ use crate::http::rate_limit::RateLimiter;
 use crate::http::static_files::StaticFiles;
 use crate::orchestrator::Orchestrator;
 use crate::providers::{self, IngressProvider};
+use crate::settings::ProtocolSettings;
 use crate::state::StateStore;
 
 pub struct AppInner {
@@ -71,6 +72,12 @@ impl AppState {
             static_files,
         })))
     }
+
+    /// The protocol settings in effect: the stored override, else the `.env` defaults.
+    pub async fn protocol_settings(&self) -> ProtocolSettings {
+        let stored = self.orchestrator.store().snapshot().await.protocol;
+        ProtocolSettings::effective(&self.config, stored.as_ref())
+    }
 }
 
 async fn shutdown_signal() {
@@ -110,7 +117,7 @@ fn log_startup(cfg: &Config) {
         provider = cfg.provider.kind.as_str(),
         wireguard = cfg.wireguard.enabled,
         trust_proxy_headers = cfg.trust_proxy_headers,
-        "starting vpn-control"
+        "starting"
     );
     if !cfg.trust_proxy_headers {
         tracing::warn!(

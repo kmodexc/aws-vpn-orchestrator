@@ -101,13 +101,13 @@ pub fn render() -> anyhow::Result<String> {
     line("");
     line("# --- OIDC (Keycloak at https://auth.kmode.dev) ---");
     line("OIDC_ISSUER_URL=https://auth.kmode.dev/realms/CHANGE_ME");
-    line("OIDC_CLIENT_ID=vpn-control");
+    line("OIDC_CLIENT_ID=console");
     line("OIDC_CLIENT_SECRET=");
     line("OIDC_REQUIRED_ROLE=vpn-admin");
     line(
         "# Comma list of client ids whose Bearer tokens are accepted (azp); default OIDC_CLIENT_ID",
     );
-    line("OIDC_ALLOWED_CLIENTS=vpn-control");
+    line("OIDC_ALLOWED_CLIENTS=console");
     line("OIDC_SCOPES=\"openid profile email\"");
     line("SESSION_IDLE_TIMEOUT_S=1800");
     line("SESSION_ABSOLUTE_TIMEOUT_S=43200");

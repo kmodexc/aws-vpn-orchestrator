@@ -47,7 +47,7 @@ export interface RotateResponse {
   public_ip: string;
 }
 
-export type EventAction = "start" | "stop" | "rotate" | "error";
+export type EventAction = "start" | "stop" | "rotate" | "settings" | "error";
 
 export interface EventEntry {
   at: number;
@@ -67,6 +67,22 @@ export interface WireGuard {
   ingress_public_key: string | null;
   ingress_address: string;
   vps_peer_snippet: string | null;
+}
+
+/** Protocol options changeable at runtime (`/api/settings`). */
+export interface ProtocolSettings {
+  reality_sni: string;
+  hy2_sni: string;
+  hysteria2: boolean;
+  hy2_obfs: boolean;
+  shadowsocks: boolean;
+}
+
+export interface SettingsResponse {
+  settings: ProtocolSettings;
+  defaults: ProtocolSettings;
+  overridden: boolean;
+  ports: { vless_tcp: number; hy2_udp: number; ss: number };
 }
 
 export interface LogoutResponse {
@@ -288,7 +304,7 @@ export function parseRotate(v: unknown): RotateResponse {
   return bad();
 }
 
-const EVENT_ACTIONS: readonly EventAction[] = ["start", "stop", "rotate", "error"];
+const EVENT_ACTIONS: readonly EventAction[] = ["start", "stop", "rotate", "settings", "error"];
 
 function parseEvent(v: unknown): EventEntry {
   if (
@@ -336,6 +352,45 @@ export function parseWireGuard(v: unknown): WireGuard {
       ingress_public_key: v.ingress_public_key,
       ingress_address: v.ingress_address,
       vps_peer_snippet: v.vps_peer_snippet,
+    };
+  }
+  return bad();
+}
+
+function parseProtocolSettings(v: unknown): ProtocolSettings {
+  if (
+    isObject(v) &&
+    isString(v.reality_sni) &&
+    isString(v.hy2_sni) &&
+    typeof v.hysteria2 === "boolean" &&
+    typeof v.hy2_obfs === "boolean" &&
+    typeof v.shadowsocks === "boolean"
+  ) {
+    return {
+      reality_sni: v.reality_sni,
+      hy2_sni: v.hy2_sni,
+      hysteria2: v.hysteria2,
+      hy2_obfs: v.hy2_obfs,
+      shadowsocks: v.shadowsocks,
+    };
+  }
+  return bad();
+}
+
+export function parseSettings(v: unknown): SettingsResponse {
+  if (
+    isObject(v) &&
+    typeof v.overridden === "boolean" &&
+    isObject(v.ports) &&
+    isInt(v.ports.vless_tcp) &&
+    isInt(v.ports.hy2_udp) &&
+    isInt(v.ports.ss)
+  ) {
+    return {
+      settings: parseProtocolSettings(v.settings),
+      defaults: parseProtocolSettings(v.defaults),
+      overridden: v.overridden,
+      ports: { vless_tcp: v.ports.vless_tcp, hy2_udp: v.ports.hy2_udp, ss: v.ports.ss },
     };
   }
   return bad();
@@ -421,6 +476,19 @@ export class ApiClient {
     return parseWireGuard(await this.get("/api/wireguard"));
   }
 
+  async settings(): Promise<SettingsResponse> {
+    return parseSettings(await this.get("/api/settings"));
+  }
+
+  async saveSettings(settings: ProtocolSettings): Promise<SettingsResponse> {
+    return parseSettings(await this.send("PUT", "/api/settings", settings));
+  }
+
+  /** Drops the override; the `.env` defaults apply again. */
+  async resetSettings(): Promise<SettingsResponse> {
+    return parseSettings(await this.send("DELETE", "/api/settings"));
+  }
+
   /** Destroys the session. Does not trigger onUnauthorized. */
   async logout(): Promise<LogoutResponse> {
     const res = parseLogout(await this.post("/auth/logout", {}, false));
@@ -435,12 +503,22 @@ export class ApiClient {
   }
 
   private post(path: string, body: object, notify = true): Promise<unknown> {
-    const headers: Record<string, string> = {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    };
+    return this.send("POST", path, body, notify);
+  }
+
+  /** A state-changing request: carries the CSRF token; `body` is sent as JSON if given. */
+  private send(
+    method: "POST" | "PUT" | "DELETE",
+    path: string,
+    body?: object,
+    notify = true,
+  ): Promise<unknown> {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
     if (this.csrfToken !== null) headers["X-CSRF-Token"] = this.csrfToken;
-    return this.request(path, { method: "POST", headers, body: JSON.stringify(body) }, notify);
+    const init: RequestInit = { method, headers };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    return this.request(path, init, notify);
   }
 
   private async request(path: string, init: RequestInit, notify: boolean): Promise<unknown> {

@@ -93,6 +93,10 @@ pub struct ProxyConfig {
     pub hy2_cert_sha256_hex: String,
     pub hy2_key_pem: Secret<String>,
     pub ss_password: Secret<String>,
+    /// Defaults for the runtime protocol settings (`/api/settings` overrides them).
+    pub hy2_enabled: bool,
+    pub hy2_obfs: bool,
+    pub ss_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -565,6 +569,9 @@ fn parse_proxy<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<ProxyConfi
     if ss_bytes.len() != 16 {
         return Err(err("SS_PASSWORD", "must decode to exactly 16 bytes"));
     }
+    let hy2_enabled = env.boolean("HY2_ENABLED", true)?;
+    let hy2_obfs = env.boolean("HY2_OBFS", false)?;
+    let ss_enabled = env.boolean("SS_ENABLED", true)?;
 
     Ok(ProxyConfig {
         reality_sni,
@@ -581,6 +588,9 @@ fn parse_proxy<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<ProxyConfi
         hy2_cert_sha256_hex,
         hy2_key_pem: Secret::new(hy2_key_pem),
         ss_password: Secret::new(ss_password),
+        hy2_enabled,
+        hy2_obfs,
+        ss_enabled,
     })
 }
 

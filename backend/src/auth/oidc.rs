@@ -100,7 +100,7 @@ impl OidcClient {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
-            .user_agent(concat!("vpn-control/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("console/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,

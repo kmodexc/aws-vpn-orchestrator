@@ -2,8 +2,8 @@
 
 use axum::http::{HeaderMap, HeaderValue, header};
 
-pub const SESSION_COOKIE: &str = "__Host-vpncp_session";
-pub const LOGIN_COOKIE: &str = "__Host-vpncp_login";
+pub const SESSION_COOKIE: &str = "__Host-sid";
+pub const LOGIN_COOKIE: &str = "__Host-login";
 
 const MAX_VALUE_LEN: usize = 128;
 
@@ -52,7 +52,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::COOKIE,
-            HeaderValue::from_static("a=b; __Host-vpncp_session=abc_DEF-123; c=d"),
+            HeaderValue::from_static("a=b; __Host-sid=abc_DEF-123; c=d"),
         );
         assert_eq!(
             get_cookie(&h, SESSION_COOKIE).as_deref(),
@@ -66,7 +66,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::COOKIE,
-            HeaderValue::from_static("__Host-vpncp_session=a b<script>"),
+            HeaderValue::from_static("__Host-sid=a b<script>"),
         );
         assert_eq!(get_cookie(&h, SESSION_COOKIE), None);
     }
@@ -75,7 +75,7 @@ mod tests {
     fn cookie_attributes() {
         let v = set_cookie(SESSION_COOKIE, "xyz", 600).unwrap();
         let s = v.to_str().unwrap();
-        assert!(s.starts_with("__Host-vpncp_session=xyz;"));
+        assert!(s.starts_with("__Host-sid=xyz;"));
         for attr in [
             "Path=/",
             "Secure",

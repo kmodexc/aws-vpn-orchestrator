@@ -227,6 +227,72 @@ describe("ApiClient", () => {
     expect(f.mock.calls[0]?.[0]).toBe("/api/events?limit=200");
   });
 
+  it("loads, saves and resets protocol settings with CSRF", async () => {
+    const settings = {
+      reality_sni: "www.example.com",
+      hy2_sni: "www.bing.com",
+      hysteria2: true,
+      hy2_obfs: true,
+      shadowsocks: false,
+    };
+    const response = {
+      settings,
+      defaults: { ...settings, reality_sni: "www.microsoft.com", hy2_obfs: false, shadowsocks: true },
+      overridden: true,
+      ports: { vless_tcp: 443, hy2_udp: 443, ss: 8443 },
+    };
+    const f = vi.fn<FetchLike>();
+    f.mockResolvedValueOnce(jsonResponse(200, ME));
+    f.mockResolvedValueOnce(jsonResponse(200, response));
+    f.mockResolvedValueOnce(jsonResponse(200, response));
+    f.mockResolvedValueOnce(jsonResponse(200, { ...response, overridden: false }));
+    const api = new ApiClient({ fetch: f });
+    await api.me();
+
+    const got = await api.settings();
+    expect(got.settings.reality_sni).toBe("www.example.com");
+    expect(got.ports.ss).toBe(8443);
+
+    await api.saveSettings(settings);
+    const [path, init] = f.mock.calls[2] ?? [];
+    expect(path).toBe("/api/settings");
+    expect(init?.method).toBe("PUT");
+    const headers = init?.headers as Record<string, string>;
+    expect(headers["X-CSRF-Token"]).toBe("csrf-123");
+    expect(headers["Content-Type"]).toBe("application/json");
+    expect(init?.body).toBe(JSON.stringify(settings));
+
+    const reset = await api.resetSettings();
+    expect(reset.overridden).toBe(false);
+    const [, del] = f.mock.calls[3] ?? [];
+    expect(del?.method).toBe("DELETE");
+    expect(del?.body).toBeUndefined();
+    expect((del?.headers as Record<string, string>)["X-CSRF-Token"]).toBe("csrf-123");
+  });
+
+  it("rejects malformed settings", async () => {
+    const api = new ApiClient({
+      fetch: mockFetch(
+        jsonResponse(200, {
+          settings: { reality_sni: "a.example.com" },
+          defaults: {},
+          overridden: false,
+          ports: { vless_tcp: 443, hy2_udp: 443, ss: 8443 },
+        }),
+      ),
+    });
+    await expect(api.settings()).rejects.toMatchObject({ code: "bad_response" });
+  });
+
+  it("accepts settings events", async () => {
+    const api = new ApiClient({
+      fetch: mockFetch(
+        jsonResponse(200, [{ at: 1, action: "settings", ip: null, detail: "x", actor: "a" }]),
+      ),
+    });
+    expect((await api.events())[0]?.action).toBe("settings");
+  });
+
   it("does not trigger onUnauthorized on logout", async () => {
     const onUnauthorized = vi.fn();
     const api = new ApiClient({

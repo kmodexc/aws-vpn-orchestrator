@@ -127,6 +127,16 @@ impl TestApp {
         self.send(request(Method::GET, uri).body(Body::empty()).unwrap())
             .await
     }
+
+    async fn get_with_session(&self, uri: &str, cookie: &str) -> Response {
+        self.send(
+            request(Method::GET, uri)
+                .header(header::COOKIE, session_cookie(cookie))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
 }
 
 fn request(method: Method, uri: &str) -> axum::http::request::Builder {
@@ -138,7 +148,7 @@ fn request(method: Method, uri: &str) -> axum::http::request::Builder {
 }
 
 fn session_cookie(cookie: &str) -> String {
-    format!("__Host-vpncp_session={cookie}")
+    format!("__Host-sid={cookie}")
 }
 
 async fn body_string(resp: Response) -> String {
@@ -190,13 +200,14 @@ fn assert_security_headers(resp: &Response, what: &str) {
 async fn security_headers_on_every_kind_of_response() {
     let app = app();
     let cases = [
-        ("/", StatusCode::OK),
+        ("/", StatusCode::FOUND),
+        ("/?login_error=denied", StatusCode::OK),
         ("/healthz", StatusCode::OK),
-        ("/assets/app-abc123.js", StatusCode::OK),
+        ("/assets/app-abc123.js", StatusCode::NOT_FOUND),
         ("/missing.js", StatusCode::NOT_FOUND),
         ("/s/a/b", StatusCode::NOT_FOUND),
         ("/api/status", StatusCode::UNAUTHORIZED),
-        ("/api/nonexistent", StatusCode::NOT_FOUND),
+        ("/api/nonexistent", StatusCode::UNAUTHORIZED),
         ("/auth/whatever", StatusCode::NOT_FOUND),
     ];
     for (uri, status) in cases {
@@ -241,7 +252,7 @@ async fn api_requires_auth_and_is_not_cached() {
     let resp = app
         .send(
             request(Method::GET, "/api/status")
-                .header(header::COOKIE, "__Host-vpncp_session=bogus")
+                .header(header::COOKIE, "__Host-sid=bogus")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -692,6 +703,7 @@ async fn oversized_bodies_are_rejected() {
 #[tokio::test]
 async fn api_paths_never_fall_back_to_index_html() {
     let app = app();
+    let (cookie, _) = app.login(&["vpn-admin"]);
     for uri in [
         "/api/nonexistent",
         "/api",
@@ -705,7 +717,7 @@ async fn api_paths_never_fall_back_to_index_html() {
         "/i/x",
         "/i/x/other.json",
     ] {
-        let resp = app.get(uri).await;
+        let resp = app.get_with_session(uri, &cookie).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
         let body = body_string(resp).await;
         assert!(
@@ -713,15 +725,70 @@ async fn api_paths_never_fall_back_to_index_html() {
             "{uri} served index.html"
         );
     }
-    let resp = app.get("/api/nonexistent").await;
+    let resp = app.get_with_session("/api/nonexistent", &cookie).await;
     assert_eq!(body_json(resp).await["error"], "not_found");
+}
+
+#[tokio::test]
+async fn anonymous_api_probing_reveals_nothing() {
+    let app = app();
+    // Known and unknown paths, any method: the same 401 JSON.
+    for (method, uri) in [
+        (Method::GET, "/api/nonexistent"),
+        (Method::GET, "/api"),
+        (Method::GET, "/api/ingress/rotate"),
+        (Method::DELETE, "/api/status"),
+        (Method::POST, "/api/whatever"),
+        (Method::PATCH, "/api/settings"),
+    ] {
+        let resp = app
+            .send(request(method.clone(), uri).body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+        assert_eq!(body_json(resp).await["error"], "unauthorized");
+    }
+}
+
+#[tokio::test]
+async fn anonymous_visitors_get_no_app_code() {
+    let app = app();
+    // Pages redirect to the IdP login (via /auth/login), keeping the target.
+    let resp = app.get("/").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()[header::LOCATION],
+        format!("{BASE}/auth/login").as_str()
+    );
+    assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+    let resp = app.get("/events?x=1").await;
+    assert_eq!(
+        resp.headers()[header::LOCATION],
+        format!("{BASE}/auth/login?return_to=%2Fevents%3Fx%3D1").as_str()
+    );
+    // Files: plain 404, never the SPA.
+    for uri in ["/assets/app-abc123.js", "/index.html", "/favicon.svg"] {
+        let resp = app.get(uri).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert!(!body_string(resp).await.contains("spa"), "{uri}");
+    }
+    // An unknown or expired session is anonymous.
+    let resp = app.get_with_session("/assets/app-abc123.js", "bogus").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // A failed login gets a neutral page instead of another redirect (no loop).
+    let resp = app.get("/?login_error=forbidden").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("This account has no access."));
+    assert!(body.contains("href=\"/auth/login\""));
+    assert!(!body.contains("spa"));
 }
 
 #[tokio::test]
 async fn spa_routes_fall_back_to_index_html() {
     let app = app();
+    let (cookie, _) = app.login(&["vpn-admin"]);
     for uri in ["/", "/dashboard", "/settings/profile?x=1"] {
-        let resp = app.get(uri).await;
+        let resp = app.get_with_session(uri, &cookie).await;
         assert_eq!(resp.status(), StatusCode::OK, "{uri}");
         assert!(
             resp.headers()[header::CONTENT_TYPE]
@@ -732,15 +799,18 @@ async fn spa_routes_fall_back_to_index_html() {
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache");
         assert_eq!(body_string(resp).await, INDEX_HTML);
     }
-    let resp = app.get("/assets/app-abc123.js").await;
+    let resp = app.get_with_session("/assets/app-abc123.js", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()[header::CACHE_CONTROL],
-        "public, max-age=31536000, immutable"
+        "private, max-age=31536000, immutable"
     );
     // path traversal is not possible
-    let resp = app.get("/../Cargo.toml").await;
+    let resp = app.get_with_session("/../Cargo.toml", &cookie).await;
     assert!(!body_string(resp).await.contains("[package]"));
-    let resp = app.get("/assets/..%2f..%2fCargo.toml").await;
+    let resp = app
+        .get_with_session("/assets/..%2f..%2fCargo.toml", &cookie)
+        .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     // non-GET to the SPA is a plain 404
     let resp = app
@@ -807,7 +877,7 @@ async fn logout_requires_csrf_and_destroys_the_session() {
         .to_str()
         .unwrap()
         .to_string();
-    assert!(set_cookie.starts_with("__Host-vpncp_session=;"));
+    assert!(set_cookie.starts_with("__Host-sid=;"));
     assert!(set_cookie.contains("Max-Age=0"));
     // IdP unreachable → falls back to the app's home page
     assert_eq!(
@@ -865,9 +935,11 @@ async fn trusted_proxy_header_selects_the_client_ip() {
 #[tokio::test]
 async fn method_not_allowed_on_api_is_json() {
     let app = app();
+    let (cookie, _) = app.login(&["vpn-admin"]);
     let resp = app
         .send(
             request(Method::DELETE, "/api/status")
+                .header(header::COOKIE, session_cookie(&cookie))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -875,4 +947,182 @@ async fn method_not_allowed_on_api_is_json() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_security_headers(&resp, "405");
     assert_eq!(body_json(resp).await["error"], "bad_request");
+}
+
+fn settings_body(reality: &str, hy2: bool, obfs: bool, ss: bool) -> String {
+    serde_json::json!({
+        "reality_sni": reality,
+        "hy2_sni": "www.bing.com",
+        "hysteria2": hy2,
+        "hy2_obfs": obfs,
+        "shadowsocks": ss,
+    })
+    .to_string()
+}
+
+impl TestApp {
+    async fn put_settings(&self, cookie: &str, csrf: &str, body: &str) -> Response {
+        self.send(
+            request(Method::PUT, "/api/settings")
+                .header(header::COOKIE, session_cookie(cookie))
+                .header("x-csrf-token", csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn ingress_config(&self) -> serde_json::Value {
+        body_json(
+            self.get(&format!("/i/{}/config.json", self.ingress_token))
+                .await,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn settings_change_the_ingress_config_and_subscription() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    let resp = app.get_with_session("/api/settings", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["overridden"], false);
+    assert_eq!(v["settings"]["reality_sni"], "www.microsoft.com");
+    assert_eq!(v["settings"]["shadowsocks"], true);
+    assert_eq!(v["ports"]["ss"], 8443);
+    assert_eq!(
+        app.ingress_config().await["inbounds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // REALITY only, other camouflage target
+    let resp = app
+        .put_settings(
+            &cookie,
+            &csrf,
+            &settings_body("WWW.Example.com", false, false, false),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["overridden"], true);
+    assert_eq!(v["settings"]["reality_sni"], "www.example.com");
+    assert_eq!(v["defaults"]["reality_sni"], "www.microsoft.com");
+
+    let cfg = app.ingress_config().await;
+    let inbounds = cfg["inbounds"].as_array().unwrap();
+    assert_eq!(inbounds.len(), 1);
+    assert_eq!(inbounds[0]["tls"]["server_name"], "www.example.com");
+
+    app.state.orchestrator.start("t".into()).await.unwrap();
+    let resp = app.get(&format!("/s/{}", app.sub_token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(body_string(resp).await)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.starts_with("vless://") && text.contains("sni=www.example.com"));
+
+    // Hysteria2 with Salamander
+    let resp = app
+        .put_settings(
+            &cookie,
+            &csrf,
+            &settings_body("www.example.com", true, true, false),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cfg = app.ingress_config().await;
+    assert_eq!(cfg["inbounds"][1]["obfs"]["type"], "salamander");
+
+    // the change is in the event log, with the actor
+    let resp = app.get_with_session("/api/events", &cookie).await;
+    let events = body_json(resp).await;
+    assert_eq!(events[0]["action"], "settings");
+    assert_eq!(events[0]["actor"], "alice");
+    assert!(
+        events[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("hy2_obfs=on")
+    );
+
+    // reset to .env
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/settings")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["overridden"], false);
+    assert_eq!(
+        app.ingress_config().await["inbounds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn settings_updates_are_validated_and_protected() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    for bad in [
+        settings_body("localhost", true, false, true),
+        settings_body("1.2.3.4", true, false, true),
+        settings_body("https://x.example.com", true, false, true),
+        r#"{"reality_sni":"a.example.com"}"#.to_string(),
+        r#"{"reality_sni":"a.example.com","hy2_sni":"b.example.com","hysteria2":true,"hy2_obfs":false,"shadowsocks":true,"extra":1}"#.to_string(),
+        String::new(),
+    ] {
+        let resp = app.put_settings(&cookie, &csrf, &bad).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // CSRF is required for a cookie session
+    let resp = app
+        .send(
+            request(Method::PUT, "/api/settings")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(settings_body(
+                    "a.example.com",
+                    true,
+                    false,
+                    true,
+                )))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // the role is required
+    let (other, other_csrf) = app.login(&["something-else"]);
+    let resp = app
+        .put_settings(
+            &other,
+            &other_csrf,
+            &settings_body("a.example.com", true, false, true),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // nothing was stored
+    let v = body_json(app.get_with_session("/api/settings", &cookie).await).await;
+    assert_eq!(v["overridden"], false);
 }

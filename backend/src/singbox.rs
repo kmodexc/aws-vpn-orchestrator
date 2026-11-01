@@ -6,6 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::settings::{ProtocolSettings, salamander_password};
 use crate::util::b64std;
 
 /// Everything except RFC 3986 "unreserved" characters is percent-encoded.
@@ -27,53 +28,61 @@ fn pem_lines(pem: &str) -> Vec<String> {
         .collect()
 }
 
-/// The sing-box (>= 1.12) server configuration pulled by the ingress on boot.
-pub fn server_config(cfg: &Config) -> Value {
+/// The sing-box (>= 1.12) server configuration pulled by the ingress (on boot and every
+/// 10 minutes). Disabled protocols have no inbound, so nothing answers on their ports.
+pub fn server_config(cfg: &Config, s: &ProtocolSettings) -> Value {
     let p = &cfg.proxy;
+    let mut inbounds = vec![json!({
+        "type": "vless",
+        "tag": "vless-reality",
+        "listen": "::",
+        "listen_port": p.vless_port,
+        "users": [{"uuid": p.vless_uuid.expose(), "flow": "xtls-rprx-vision"}],
+        "tls": {
+            "enabled": true,
+            "server_name": s.reality_sni,
+            "reality": {
+                "enabled": true,
+                "handshake": {"server": s.reality_sni, "server_port": 443},
+                "private_key": p.reality_private_key.expose(),
+                "short_id": [p.reality_short_id],
+            }
+        }
+    })];
+    if s.hysteria2 {
+        let mut hy2 = json!({
+            "type": "hysteria2",
+            "tag": "hysteria2",
+            "listen": "::",
+            "listen_port": p.hy2_port,
+            "users": [{"password": p.hy2_password.expose()}],
+            "tls": {
+                "enabled": true,
+                "server_name": s.hy2_sni,
+                "alpn": ["h3"],
+                "certificate": pem_lines(&p.hy2_cert_pem),
+                "key": pem_lines(p.hy2_key_pem.expose()),
+            }
+        });
+        if s.hy2_obfs {
+            hy2["obfs"] = json!({"type": "salamander", "password": salamander_password(cfg)});
+        }
+        inbounds.push(hy2);
+    }
+    if s.shadowsocks {
+        inbounds.push(json!({
+            "type": "shadowsocks",
+            "tag": "shadowsocks",
+            "listen": "::",
+            "listen_port": p.ss_port,
+            "method": "2022-blake3-aes-128-gcm",
+            "password": p.ss_password.expose(),
+        }));
+    }
     let mut config = json!({
         "log": {"level": "warn"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
-        "inbounds": [
-            {
-                "type": "vless",
-                "tag": "vless-reality",
-                "listen": "::",
-                "listen_port": p.vless_port,
-                "users": [{"uuid": p.vless_uuid.expose(), "flow": "xtls-rprx-vision"}],
-                "tls": {
-                    "enabled": true,
-                    "server_name": p.reality_sni,
-                    "reality": {
-                        "enabled": true,
-                        "handshake": {"server": p.reality_sni, "server_port": 443},
-                        "private_key": p.reality_private_key.expose(),
-                        "short_id": [p.reality_short_id],
-                    }
-                }
-            },
-            {
-                "type": "hysteria2",
-                "tag": "hysteria2",
-                "listen": "::",
-                "listen_port": p.hy2_port,
-                "users": [{"password": p.hy2_password.expose()}],
-                "tls": {
-                    "enabled": true,
-                    "server_name": p.hy2_sni,
-                    "alpn": ["h3"],
-                    "certificate": pem_lines(&p.hy2_cert_pem),
-                    "key": pem_lines(p.hy2_key_pem.expose()),
-                }
-            },
-            {
-                "type": "shadowsocks",
-                "tag": "shadowsocks",
-                "listen": "::",
-                "listen_port": p.ss_port,
-                "method": "2022-blake3-aes-128-gcm",
-                "password": p.ss_password.expose(),
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"final": "direct", "default_domain_resolver": "local"}
     });
@@ -103,43 +112,55 @@ pub fn server_config(cfg: &Config) -> Value {
     config
 }
 
-/// Client share links for the given ingress IPv4 address. IPv6 is never published, which the
-/// type enforces.
-pub fn share_links(cfg: &Config, ip: Ipv4Addr) -> Vec<String> {
+/// Client share links for the given ingress IPv4 address, enabled protocols only. IPv6 is
+/// never published, which the type enforces.
+pub fn share_links(cfg: &Config, s: &ProtocolSettings, ip: Ipv4Addr) -> Vec<String> {
     let p = &cfg.proxy;
     let name = &cfg.profile_name;
-    let vless = format!(
+    let mut links = vec![format!(
         "vless://{uuid}@{ip}:{port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={sni}&fp=chrome&pbk={pbk}&sid={sid}&type=tcp#{frag}",
         uuid = enc(p.vless_uuid.expose()),
         port = p.vless_port,
-        sni = enc(&p.reality_sni),
+        sni = enc(&s.reality_sni),
         pbk = enc(&p.reality_public_key),
         sid = enc(&p.reality_short_id),
         frag = enc(&format!("{name}-reality")),
-    );
-    let hy2 = format!(
-        "hysteria2://{pw}@{ip}:{port}?sni={sni}&insecure=1&pinSHA256={pin}#{frag}",
-        pw = enc(p.hy2_password.expose()),
-        port = p.hy2_port,
-        sni = enc(&p.hy2_sni),
-        pin = enc(&p.hy2_cert_sha256_hex),
-        frag = enc(&format!("{name}-hy2")),
-    );
-    let ss = format!(
-        "ss://{userinfo}@{ip}:{port}#{frag}",
-        userinfo = enc(&format!(
-            "2022-blake3-aes-128-gcm:{}",
-            p.ss_password.expose()
-        )),
-        port = p.ss_port,
-        frag = enc(&format!("{name}-ss")),
-    );
-    vec![vless, hy2, ss]
+    )];
+    if s.hysteria2 {
+        let obfs = if s.hy2_obfs {
+            format!(
+                "&obfs=salamander&obfs-password={}",
+                enc(&salamander_password(cfg))
+            )
+        } else {
+            String::new()
+        };
+        links.push(format!(
+            "hysteria2://{pw}@{ip}:{port}?sni={sni}&insecure=1&pinSHA256={pin}{obfs}#{frag}",
+            pw = enc(p.hy2_password.expose()),
+            port = p.hy2_port,
+            sni = enc(&s.hy2_sni),
+            pin = enc(&p.hy2_cert_sha256_hex),
+            frag = enc(&format!("{name}-hy2")),
+        ));
+    }
+    if s.shadowsocks {
+        links.push(format!(
+            "ss://{userinfo}@{ip}:{port}#{frag}",
+            userinfo = enc(&format!(
+                "2022-blake3-aes-128-gcm:{}",
+                p.ss_password.expose()
+            )),
+            port = p.ss_port,
+            frag = enc(&format!("{name}-ss")),
+        ));
+    }
+    links
 }
 
 /// The subscription body: standard base64 of the links joined by `\n`.
-pub fn subscription_body(cfg: &Config, ip: Ipv4Addr) -> String {
-    b64std(share_links(cfg, ip).join("\n").as_bytes())
+pub fn subscription_body(cfg: &Config, s: &ProtocolSettings, ip: Ipv4Addr) -> String {
+    b64std(share_links(cfg, s, ip).join("\n").as_bytes())
 }
 
 /// The `profile-title` header value: `base64:<b64(PROFILE_NAME)>`.
@@ -153,6 +174,10 @@ mod tests {
     use crate::config::tests::valid_pairs;
     use base64::Engine;
 
+    fn defaults(cfg: &Config) -> ProtocolSettings {
+        ProtocolSettings::defaults(cfg)
+    }
+
     fn config(extra: &[(&str, &str)]) -> Config {
         let mut pairs = valid_pairs();
         for (k, v) in extra {
@@ -165,7 +190,7 @@ mod tests {
     fn share_links_have_expected_shape() {
         let cfg = config(&[("PROFILE_NAME", "my-trip")]);
         let ip = Ipv4Addr::new(203, 0, 113, 7);
-        let links = share_links(&cfg, ip);
+        let links = share_links(&cfg, &defaults(&cfg), ip);
         assert_eq!(links.len(), 3);
         let p = &cfg.proxy;
 
@@ -210,21 +235,21 @@ mod tests {
     fn subscription_is_base64_of_newline_joined_links() {
         let cfg = config(&[]);
         let ip = Ipv4Addr::new(203, 0, 113, 9);
-        let body = subscription_body(&cfg, ip);
+        let body = subscription_body(&cfg, &defaults(&cfg), ip);
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(body)
             .unwrap();
         let text = String::from_utf8(decoded).unwrap();
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines, share_links(&cfg, ip));
+        assert_eq!(lines, share_links(&cfg, &defaults(&cfg), ip));
         assert_eq!(profile_title(&cfg), "base64:dHJhdmVs");
     }
 
     #[test]
     fn server_config_without_wireguard() {
         let cfg = config(&[]);
-        let c = server_config(&cfg);
+        let c = server_config(&cfg, &defaults(&cfg));
         assert_eq!(c["route"]["final"], "direct");
         assert_eq!(c["route"]["default_domain_resolver"], "local");
         assert!(c.get("endpoints").is_none());
@@ -242,6 +267,7 @@ mod tests {
         );
         assert_eq!(inbounds[1]["type"], "hysteria2");
         assert_eq!(inbounds[1]["tls"]["alpn"][0], "h3");
+        assert!(inbounds[1].get("obfs").is_none());
         let cert = inbounds[1]["tls"]["certificate"].as_array().unwrap();
         assert_eq!(cert[0], "-----BEGIN CERTIFICATE-----");
         assert_eq!(cert[cert.len() - 1], "-----END CERTIFICATE-----");
@@ -260,7 +286,7 @@ mod tests {
             ("WG_VPS_PUBLIC_KEY", &vps_pub),
             ("WG_MTU", "1400"),
         ]);
-        let c = server_config(&cfg);
+        let c = server_config(&cfg, &defaults(&cfg));
         assert_eq!(c["route"]["final"], "wg-exit");
         let ep = &c["endpoints"][0];
         assert_eq!(ep["type"], "wireguard");
@@ -272,5 +298,45 @@ mod tests {
         assert_eq!(ep["peers"][0]["public_key"], vps_pub.as_str());
         assert_eq!(ep["peers"][0]["persistent_keepalive_interval"], 25);
         assert_eq!(ep["peers"][0]["allowed_ips"][1], "::/0");
+    }
+
+    #[test]
+    fn settings_drive_inbounds_and_links() {
+        let cfg = config(&[]);
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let s = ProtocolSettings {
+            reality_sni: "www.example.com".into(),
+            hy2_sni: "cdn.example.net".into(),
+            hysteria2: true,
+            hy2_obfs: true,
+            shadowsocks: false,
+        };
+        let c = server_config(&cfg, &s);
+        let inbounds = c["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["tls"]["server_name"], "www.example.com");
+        assert_eq!(
+            inbounds[0]["tls"]["reality"]["handshake"]["server"],
+            "www.example.com"
+        );
+        assert_eq!(inbounds[1]["tls"]["server_name"], "cdn.example.net");
+        assert_eq!(inbounds[1]["obfs"]["type"], "salamander");
+        let pw = salamander_password(&cfg);
+        assert_eq!(inbounds[1]["obfs"]["password"], pw.as_str());
+
+        let links = share_links(&cfg, &s, ip);
+        assert_eq!(links.len(), 2);
+        assert!(links[0].contains("&sni=www.example.com&"));
+        assert!(links[1].contains("?sni=cdn.example.net&"));
+        assert!(links[1].contains(&format!("&obfs=salamander&obfs-password={}#", enc(&pw))));
+        assert!(!links.iter().any(|l| l.starts_with("ss://")));
+
+        let only_reality = ProtocolSettings {
+            hysteria2: false,
+            ..s
+        };
+        let c = server_config(&cfg, &only_reality);
+        assert_eq!(c["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(share_links(&cfg, &only_reality, ip).len(), 1);
     }
 }

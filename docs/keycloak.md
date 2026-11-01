@@ -48,10 +48,10 @@ If the issuer shows an internal host name or `http://`, Keycloak's hostname conf
 Only users with this role may use vpn-control (`OIDC_REQUIRED_ROLE`, default `vpn-admin`). A user
 who logs in without it gets *"Your account lacks the required role"* (HTTP 403).
 
-> Alternatively use a **client role** of the web client (*Clients → vpn-control → Roles*); the
+> Alternatively use a **client role** of the web client (*Clients → console → Roles*); the
 > backend accepts `OIDC_REQUIRED_ROLE` from `realm_access.roles` **or**
 > `resource_access.<OIDC_CLIENT_ID>.roles`. Use a realm role if you also use the Android client,
-> because client roles of `vpn-control` are not automatically present in the Android client's tokens.
+> because client roles of `console` are not automatically present in the Android client's tokens.
 
 ## 3. Web client (confidential, used by the backend)
 
@@ -60,8 +60,8 @@ who logs in without it gets *"Your account lacks the required role"* (HTTP 403).
 **Step 1 — General settings**
 
 - Client type: **OpenID Connect**
-- Client ID: `vpn-control` (→ `OIDC_CLIENT_ID`)
-- Name: `VPN control plane`
+- Client ID: `console` (→ `OIDC_CLIENT_ID`)
+- Name: `Console`
 - Always display in UI: Off
 
 **Step 2 — Capability config**
@@ -101,9 +101,22 @@ who logs in without it gets *"Your account lacks the required role"* (HTTP 403).
 
 **Recommended — minimal token contents**
 
-*Client scopes* tab → `vpn-control-dedicated` → *Scope* tab → **Full scope allowed: Off** →
+*Client scopes* tab → `console-dedicated` → *Scope* tab → **Full scope allowed: Off** →
 **Assign role** → filter by realm roles → `vpn-admin`. Tokens for this client then contain only
 the `vpn-admin` role instead of every role the user has.
+
+### Keep the sign-in neutral
+
+Anyone who opens the control plane without a session sees only this Keycloak sign-in, so nothing
+on it should hint at what is behind it:
+
+- Client ID and name: neutral (`console` / `Console`). They appear in the login URL
+  (`client_id=…`) and in the account console. An existing client can be renamed in
+  *Clients → <client> → Settings → Client ID*; then set `OIDC_CLIENT_ID` (and
+  `OIDC_ALLOWED_CLIENTS`) in `.env` to the new id and restart the app. Client roles move with
+  the client.
+- *Realm settings → General → Display name* / *HTML Display name*: neutral, or empty.
+- Login theme: the default, or a neutral one — no VPN wording or icons.
 
 ## 4. Make sure the role is in the access token
 
@@ -111,15 +124,15 @@ The backend reads roles from the **access token** (`realm_access.roles` /
 `resource_access.<client>.roles`). Keycloak puts them there through the default client scope
 **`roles`**:
 
-- *Clients → vpn-control → Client scopes*: `roles` must be listed as **Default**
+- *Clients → console → Client scopes*: `roles` must be listed as **Default**
   (it is by default). Also keep `profile`, `email` default (or adjust `OIDC_SCOPES`).
 - *Client scopes → roles → Mappers → realm roles*: **Add to access token = On**.
 
-Verify: *Clients → vpn-control → Client scopes → Evaluate* → pick your user →
+Verify: *Clients → console → Client scopes → Evaluate* → pick your user →
 **Generated access token**. You must see
 
 ```json
-"azp": "vpn-control",
+"azp": "console",
 "realm_access": { "roles": ["vpn-admin"] },
 "typ": "Bearer"
 ```
@@ -146,7 +159,7 @@ resulting access token as `Authorization: Bearer …`.
 
 *Clients* → **Create client**
 
-- Client type OpenID Connect, Client ID e.g. `vpn-control-android`
+- Client type OpenID Connect, Client ID e.g. `console-android`
 - Client authentication: **Off** (public)
 - Standard flow **On**; Direct access grants, Implicit, Device grant: **Off**
 - PKCE Method / *Advanced* → Code Challenge Method: **S256**
@@ -159,7 +172,7 @@ resulting access token as `Authorization: Bearer …`.
 Then allow its tokens in `.env`:
 
 ```ini
-OIDC_ALLOWED_CLIENTS=vpn-control,vpn-control-android
+OIDC_ALLOWED_CLIENTS=console,console-android
 ```
 
 and restart: `docker compose up -d`.
@@ -181,7 +194,7 @@ See SPEC §4. In short:
   Checking `azp` against an allow-list ensures that a token obtained by some *other* client of the
   realm (which the user might also be logged into) cannot be replayed against vpn-control, even if
   that user has the `vpn-admin` role. If you want `aud` to name vpn-control as well, add an
-  *Audience* mapper (Included Client Audience = `vpn-control`, Add to access token = On) to the
+  *Audience* mapper (Included Client Audience = `console`, Add to access token = On) to the
   dedicated scopes — harmless, but not required.
 
 ## 8. Troubleshooting
