@@ -87,6 +87,8 @@ pub fn render() -> anyhow::Result<String> {
     line("# Host port on 127.0.0.1 that Apache proxies to. Convention 1xxyy:");
     line("# xx = id of this compose stack (01-99), yy = 01 (the only forwarded port).");
     line("APP_HOST_PORT=11001");
+    line("# Image to run (built by GitHub Actions). Pin a commit tag, e.g. :sha-1a2b3c4");
+    line("VPN_CONTROL_IMAGE=ghcr.io/kmodexc/aws-vpn-orchestrator:latest");
     line("");
     line("# --- Server ---");
     line("BIND_ADDR=0.0.0.0:8080");

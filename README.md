@@ -104,14 +104,15 @@ On the VPS, in the repository checkout:
 
 ```bash
 umask 077
-docker compose run --rm --no-deps -T app gen-env > .env   # builds the image the first time
+docker compose run --rm --no-deps -T app gen-env > .env   # pulls the image the first time
 chmod 600 .env
 $EDITOR .env
 ```
 
 `gen-env` fills every secret with fresh random values (path tokens, VLESS UUID, REALITY keypair
 and short id, Hysteria2 password and self-signed certificate, Shadowsocks key, WireGuard keypair).
-Fill in the placeholders: `DOMAIN`, `PUBLIC_BASE_URL`, `OIDC_*`. `PROVIDER`, `AWS_*` and
+Fill in the placeholders: `DOMAIN`, `PUBLIC_BASE_URL`, `OIDC_*`, and pin `VPN_CONTROL_IMAGE`
+to a commit tag (see [Container image](#container-image)). `PROVIDER`, `AWS_*` and
 `INGRESS_INSTANCE` are written by the AWS setup script in step 5. Every variable is documented in [.env.example](.env.example).
 
 `APP_HOST_PORT` is the localhost port Apache forwards to (`gen-env` writes `11001` as an example).
@@ -232,7 +233,8 @@ Scoping notes:
 Start the app:
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose ps            # app must become "healthy"
 docker compose logs -f app   # startup errors name the offending variable
 curl -fsS http://127.0.0.1:11001/healthz   # use your APP_HOST_PORT
@@ -294,11 +296,40 @@ After every IP rotation the clients pick up the new address on their next subscr
 | Logs | `docker compose logs -f app` (rotated: 3 × 10 MB); Apache: `/var/log/apache2/` (the vhost's access log replaces the URL of `/s/`, `/i/` and `/auth/callback` requests with a redacted line). Tokens and token paths are never logged. |
 | Status | `docker compose ps`; the app's `/healthz` is used by the container healthcheck. |
 | Backup | `.env` (encrypted, offline — e.g. password manager) is all you need to rebuild. Optional: the `app_state` volume (event log, burned IPs) and `/etc/letsencrypt` (certificates; can be re-issued with certbot if lost). |
-| Upgrade | `git pull && docker compose build --pull && docker compose up -d`. Review the diff first (including `deploy/apache/vpn-control.conf` against your installed site file). Apache and certbot are updated by the host's package manager. |
+| Upgrade | `git pull`, set `VPN_CONTROL_IMAGE` in `.env` to the new `sha-<commit>` tag, then `docker compose pull && docker compose up -d`. Roll back by setting the previous tag. Review the diff first (including `deploy/apache/vpn-control.conf` against your installed site file). Apache and certbot are updated by the host's package manager. |
 | Rotate secrets | See [docs/security.md → Secret rotation](docs/security.md#secret-rotation). |
 | Update sing-box on the ingress | bump `SING_BOX_VERSION` + checksums in `bootstrap.sh`, re-run it on the ingress. |
 | Certificates | Renewed automatically by certbot's systemd timer (`systemctl list-timers | grep certbot`); Apache is reloaded after renewal. |
 | Stop everything | `docker compose down` (volumes are kept; `down -v` deletes the state). Optionally `sudo a2dissite vpn-control && sudo systemctl reload apache2`. |
+
+### Container image
+
+The image is built by GitHub Actions ([.github/workflows/image.yml](.github/workflows/image.yml)) on
+every push to `main` and every `v*` tag, and published to GitHub Container Registry:
+
+| Tag | Meaning |
+|---|---|
+| `ghcr.io/kmodexc/aws-vpn-orchestrator:sha-<short commit>` | exactly that commit — **use this in production** |
+| `…:latest` | newest build of `main` |
+| `…:1.2.3`, `…:1.2` | release tag `v1.2.3` |
+
+The server only pulls; it never compiles. (The Rust build needs more than 3 GB RAM — on a small
+VPS that starves the host.) The image contains no secrets: everything comes from `.env` at runtime.
+
+Each pushed image carries a signed build-provenance attestation. To check that an image was built
+by this repository's workflow before deploying it:
+
+```bash
+gh attestation verify oci://ghcr.io/kmodexc/aws-vpn-orchestrator:sha-<commit> --repo kmodexc/aws-vpn-orchestrator
+```
+
+Building locally still works (`docker compose build`, tagged with the same name). On a host with
+little RAM, limit Cargo to one job and cap the builder, so a failing build cannot freeze the host:
+
+```bash
+docker buildx create --name lowmem --driver docker-container --driver-opt memory=3g --driver-opt memory-swap=3g
+CARGO_BUILD_JOBS=1 BUILDX_BUILDER=lowmem docker compose build
+```
 
 ### Reproducible images
 

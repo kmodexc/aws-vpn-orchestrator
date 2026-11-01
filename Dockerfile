@@ -64,7 +64,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 # 4. Backend build
 # ---------------------------------------------------------------------------------------------
 FROM chef AS backend
-ENV CARGO_TERM_COLOR=never
+# Parallel rustc jobs. Each AWS SDK crate needs well over 1 GB while compiling; on a small host
+# build with CARGO_BUILD_JOBS=1 (see docker-compose.yml) so they are not compiled side by side.
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_TERM_COLOR=never \
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 COPY --from=planner /src/backend/recipe.json recipe.json
 # Cached layer: all dependencies (incl. the AWS SDK). Invalidated only by Cargo.toml/Cargo.lock.
 RUN cargo chef cook --release --locked --recipe-path recipe.json

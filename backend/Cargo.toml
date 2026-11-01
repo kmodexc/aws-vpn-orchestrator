@@ -67,6 +67,16 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
+# The generated AWS SDK service crates are huge. Optimising them as one codegen unit at -O3 needs
+# several GB of RAM per crate for no measurable gain (they only build and parse API requests).
+[profile.release.package.aws-sdk-ec2]
+opt-level = 1
+codegen-units = 16
+
+[profile.release.package.aws-sdk-lightsail]
+opt-level = 1
+codegen-units = 16
+
 # The AWS SDK crates are very large; keep debug builds small.
 [profile.dev]
 debug = "line-tables-only"

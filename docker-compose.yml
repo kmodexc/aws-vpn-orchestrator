@@ -9,6 +9,11 @@
 # * All configuration and secrets live in ./.env (chmod 600). Create it with:
 #     docker compose run --rm --no-deps -T app gen-env > .env && chmod 600 .env
 #   then fill in the placeholders. See .env.example for every variable.
+# * The image is built by GitHub Actions (.github/workflows/image.yml) and pulled from GHCR, so
+#   the server never compiles anything (the Rust build needs > 3 GB RAM). Pin a tag in .env:
+#     VPN_CONTROL_IMAGE=ghcr.io/kmodexc/aws-vpn-orchestrator:sha-<commit>
+#   `docker compose pull && docker compose up -d` deploys it. A local `docker compose build`
+#   still works; on a small host use CARGO_BUILD_JOBS=1 and a memory-capped builder.
 # * Read-only root FS, all capabilities dropped, no-new-privileges, resource limits, rotated logs.
 
 name: vpn-control
@@ -24,7 +29,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: vpn-control:local
+      args:
+        # Low-memory host: CARGO_BUILD_JOBS=1 docker compose build
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-default}
+    image: ${VPN_CONTROL_IMAGE:-ghcr.io/kmodexc/aws-vpn-orchestrator:latest}
+    # Use the published image; build locally only if it cannot be pulled (or on `--build`).
+    pull_policy: missing
     restart: unless-stopped
     env_file:
       - path: .env
