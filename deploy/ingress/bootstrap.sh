@@ -149,7 +149,8 @@ if [[ ${installed_version} != "${SING_BOX_VERSION}" ]]; then
 else
   log "sing-box ${SING_BOX_VERSION} already installed"
 fi
-"${SB_BIN}" version | head -n1 >&2
+# `|| true`: under pipefail a SIGPIPE from head would abort the whole bootstrap.
+"${SB_BIN}" version 2>/dev/null | head -n1 >&2 || true
 
 # ---------------------------------------------------------------------------------------------
 # 3. User, directories, fetch credentials
