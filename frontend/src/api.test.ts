@@ -307,6 +307,7 @@ describe("ApiClient", () => {
         config_sha256: "ab".repeat(32),
         log_lines: 2,
         log_dropped: 0,
+        log_purge_at: null,
       },
       debug_log: { level: "info", until: 1_700_001_800 },
       log_level: "info",
@@ -316,7 +317,7 @@ describe("ApiClient", () => {
     f.mockResolvedValueOnce(jsonResponse(200, ME));
     f.mockResolvedValueOnce(jsonResponse(200, telemetry));
     f.mockResolvedValueOnce(
-      jsonResponse(200, { lines: [{ seq: 7, text: "x" }], next: 8, dropped: 1 }),
+      jsonResponse(200, { lines: [{ seq: 7, text: "x" }], next: 8, dropped: 1, epoch: 3 }),
     );
     f.mockResolvedValueOnce(jsonResponse(200, { ...telemetry, debug_log: null, log_level: "warn" }));
     const api = new ApiClient({ fetch: f });
@@ -328,6 +329,7 @@ describe("ApiClient", () => {
     expect(f.mock.calls[2]?.[0]).toBe("/api/ingress/logs?after=7");
     expect(l.lines[0]?.text).toBe("x");
     expect(l.next).toBe(8);
+    expect(l.epoch).toBe(3);
     const cleared = await api.clearDebugLog();
     expect(cleared.debug_log).toBeNull();
     expect(f.mock.calls[3]?.[1]?.method).toBe("DELETE");

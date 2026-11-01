@@ -19,21 +19,27 @@ export function LogsCard({ api }: Props) {
   const [filter, setFilter] = useState("");
   const [follow, setFollow] = useState(true);
   const next = useRef(0);
-  const loaded = useRef(false);
+  const epoch = useRef<number | null>(null);
   const pre = useRef<HTMLPreElement>(null);
   const bodyId = useId();
   const filterId = useId();
 
   const fetchMore = useCallback(async () => {
     try {
-      const chunk = await api.logs(loaded.current ? next.current : 0);
-      loaded.current = true;
+      let chunk = await api.logs(epoch.current === null ? 0 : next.current);
+      const restarted = epoch.current !== null && chunk.epoch !== epoch.current;
+      if (restarted) {
+        // The server restarted or the buffer was cleared: its numbering starts over.
+        chunk = await api.logs(0);
+        setLines([]);
+      }
+      epoch.current = chunk.epoch;
       next.current = chunk.next;
       setDropped(chunk.dropped);
       setError(null);
       if (chunk.lines.length > 0) {
         setLines((old) => {
-          const all = old.concat(chunk.lines);
+          const all = (restarted ? [] : old).concat(chunk.lines);
           return all.length > MAX_SHOWN ? all.slice(all.length - MAX_SHOWN) : all;
         });
       }
@@ -73,6 +79,7 @@ export function LogsCard({ api }: Props) {
   const clear = async () => {
     try {
       const chunk = await api.clearLogs();
+      epoch.current = chunk.epoch;
       next.current = chunk.next;
       setLines([]);
       setDropped(0);
@@ -108,8 +115,8 @@ export function LogsCard({ api }: Props) {
           <>
             <p className="muted small">
               sing-box journal lines as reported by the ingress (about once a minute). Held in
-              memory only; gone when the control plane restarts. At level <code>warn</code> only
-              problems appear.
+              memory only; gone when the control plane restarts, and discarded one hour after
+              debug logging ends. At level <code>warn</code> only problems appear.
             </p>
             <div className="inline-fields">
               <div className="field">

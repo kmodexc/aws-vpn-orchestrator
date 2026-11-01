@@ -214,10 +214,10 @@ unauthorized`, so the routes cannot be enumerated anonymously.
 | `GET /s/{token}` | path token | `200 text/plain` base64 subscription; headers `profile-update-interval: <SUB_UPDATE_HOURS>`, `profile-title: base64:<b64(PROFILE_NAME)>`, `Cache-Control: no-store`; `503` if the ingress has no public IP |
 | `GET /i/{token}/config.json` | path token | `200 application/json` sing-box server config (§7) |
 | `POST /i/{token}/report` | path token | body (JSON, `deny_unknown_fields`): `{ "version", "uptime_s": int\|null, "connections": int\|null, "upload_total": int\|null, "download_total": int\|null, "config_sha256": hex64, "log": [string, …], "log_dropped": int }` → `200 { "config_sha256": hex64, "config_stale": bool }` (`config_sha256` = SHA-256 of the bytes `/config.json` serves right now; the ingress re-pulls when `config_stale`). Counters and lines are kept **in memory only** (§5a). Wrong token: generic 404 + failure count; bad body: plain `400`; too large: plain `413` |
-| `GET /api/ingress/telemetry` | admin | `{ "report": { "last_report_at": int\|null, "version", "uptime_s", "connections", "upload_total", "download_total", "upload_24h": int, "download_24h": int, "config_sha256", "log_lines": int, "log_dropped": int }, "debug_log": { "level", "until": int } \| null, "log_level": string, "now": int }` |
-| `GET /api/ingress/logs?after=N&limit=M` | admin | `{ "lines": [{ "seq": int, "text": string }], "next": int, "dropped": int }` — lines with `seq >= N`, oldest first, `M ≤ 2000` |
+| `GET /api/ingress/telemetry` | admin | `{ "report": { "last_report_at": int\|null, "version", "uptime_s", "connections", "upload_total", "download_total", "upload_24h": int, "download_24h": int, "config_sha256", "log_lines": int, "log_dropped": int, "log_purge_at": int\|null }, "debug_log": { "level", "until": int } \| null, "log_level": string, "now": int }` |
+| `GET /api/ingress/logs?after=N&limit=M` | admin | `{ "lines": [{ "seq": int, "text": string }], "next": int, "dropped": int, "epoch": int }` — lines with `seq >= N`, oldest first, `M ≤ 2000`; `next` is the real end of the buffer (never beyond it) |
 | `DELETE /api/ingress/logs` | admin + CSRF | forget all buffered lines |
-| `PUT /api/settings/debug-log` | admin + CSRF | body `{ "level": "info"\|"debug"\|"trace", "minutes": 1..1440 }` → telemetry response; stored with an expiry, logged as a `settings` event |
+| `PUT /api/settings/debug-log` | admin + CSRF | body `{ "level": "info"\|"debug", "minutes": 1..60 }` → telemetry response; stored with an expiry, logged as a `settings` event |
 | `DELETE /api/settings/debug-log` | admin + CSRF | back to `warn` now → telemetry response |
 | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout` | see §4 | |
 | any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `200` with a minimal neutral HTML page (title "Console", one link to `/auth/login?return_to=<path>`; never a redirect, so crawlers create no pending logins and a failing SSO login cannot loop), any file is a plain 404, and `/?login_error=<code>` is the same page with a short message. The site therefore shows nothing but the IdP login to anyone not signed in. |
@@ -240,14 +240,19 @@ report loses nothing. When the reply says `config_stale`, it starts `sing-box-co
 at once, so a changed setting or log level reaches the ingress within about a minute.
 
 The control plane keeps the latest counters, 48 hourly traffic buckets (deltas of the cumulative
-totals; a counter that went backwards means sing-box restarted) and the last 2000 log lines in
-memory. Nothing of this is written to disk: at log level `info` and above the lines contain
+totals against the last *known* reading; a report without totals attributes nothing; a counter
+that went backwards means sing-box restarted) and the last 2000 log lines in memory. Log pages
+carry an `epoch` that changes on restart or clearing, so a client with an old cursor starts
+over. One hour after a debug level ends (expiry or manual revert) the buffered lines are
+discarded. Nothing of this is written to disk: at log level `info` and above the lines contain
 client addresses and destinations. Control characters are stripped from lines, lines are capped
 at 1000 characters. A restart of the control plane empties the buffer.
 
-The sing-box log level is `warn` by default (§7) and can be raised to `info`/`debug`/`trace`
-for 1–1440 minutes by an admin; `state.json` stores `{ level, until }` and the served config
-falls back to `warn` once `until` has passed, with no further action needed.
+The sing-box log level is `warn` by default (§7) and can be raised to `info`/`debug`
+for 1–60 minutes by an admin; `state.json` stores `{ level, until }` and the served config
+falls back to `warn` once `until` has passed, with no further action needed. Any change of the
+served config — this included — makes the fetcher restart sing-box (no live reload), which
+drops active connections for a few seconds; the UI says so.
 
 ## 6. Ingress providers (Rust trait)
 
@@ -283,7 +288,9 @@ The ingress pulls it on boot, every 10 minutes, and at once when a report reply 
 is stale (§5a). `log.level` is `warn` unless a debug level is active (§5a); `log.timestamp` is
 on. `experimental.clash_api` is always present: `external_controller = "127.0.0.1:9090"` with
 the derived secret, so the reporter can read connection and traffic counters — loopback only,
-never exposed. `REALITY_SNI`, `HY2_SNI` and which inbounds exist come from the effective protocol
+never exposed. `route.rules` = `[{"action": "resolve"}, {"ip_is_private": true, "action": "reject"}]`:
+proxied connections to loopback, private and link-local destinations are refused, so a VPN user
+cannot reach that API, the instance metadata service or the VPC through the tunnel. `REALITY_SNI`, `HY2_SNI` and which inbounds exist come from the effective protocol
 settings (§5 `/api/settings`): the VLESS inbound always exists; the Hysteria2 inbound only with `hysteria2`, and with `hy2_obfs` it gets
 `"obfs": {"type": "salamander", "password": <b64url(sha256("hysteria2-salamander\0" + HY2_PASSWORD))>}`;
 the Shadowsocks inbound only with `shadowsocks`.

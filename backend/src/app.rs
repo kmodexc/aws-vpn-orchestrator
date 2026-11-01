@@ -43,6 +43,18 @@ impl AppState {
     /// Build the state. Performs no network I/O (OIDC discovery is lazy); opens the state store.
     pub fn new(config: Config, provider: Arc<dyn IngressProvider>) -> anyhow::Result<Self> {
         let store = Arc::new(StateStore::open(&config.state_dir)?);
+        let telemetry = Telemetry::default();
+        // A debug window that was running when the previous process stopped must still end —
+        // and its lines must still be purged — after a restart.
+        if let Some(d) = store.peek().debug_log {
+            let now = crate::util::unix_now();
+            let max_until = now + i64::from(crate::settings::MAX_DEBUG_MINUTES) * 60;
+            if d.until > max_until {
+                tracing::warn!("stored debug log window exceeds the maximum; ignoring it");
+            } else if d.until > now {
+                telemetry.schedule_purge(d.until + crate::telemetry::LOG_RETENTION_AFTER_DEBUG_S);
+            }
+        }
         let p = &config.provider;
         let (region, instance) = match p.kind {
             ProviderKind::Fake => (
@@ -73,7 +85,7 @@ impl AppState {
             orchestrator,
             limiter: RateLimiter::default(),
             static_files,
-            telemetry: Telemetry::default(),
+            telemetry,
         })))
     }
 

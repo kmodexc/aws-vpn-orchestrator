@@ -89,9 +89,20 @@ pub fn server_config_with(cfg: &Config, s: &ProtocolSettings, log_level: &str) -
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct", "default_domain_resolver": "local"},
+        "route": {
+            // Clients must not reach anything on or around the ingress through the proxy:
+            // not the loopback stats API below, not the VPC, not link-local (metadata).
+            // Domains are resolved first so the IP rule also covers names that point there.
+            "rules": [
+                {"action": "resolve"},
+                {"ip_is_private": true, "action": "reject"}
+            ],
+            "final": "direct",
+            "default_domain_resolver": "local"
+        },
         // Local stats API for the reporter on the ingress (connections, traffic). Loopback
-        // only; the reporter derives the same secret from INGRESS_TOKEN.
+        // only (and unreachable through the proxy, see the route rules); the reporter derives
+        // the same secret from INGRESS_TOKEN.
         "experimental": {
             "clash_api": {
                 "external_controller": "127.0.0.1:9090",
@@ -265,6 +276,10 @@ mod tests {
         let c = server_config(&cfg, &defaults(&cfg));
         assert_eq!(c["route"]["final"], "direct");
         assert_eq!(c["log"]["level"], "warn");
+        let rules = c["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["action"], "resolve");
+        assert_eq!(rules[1]["ip_is_private"], true);
+        assert_eq!(rules[1]["action"], "reject");
         assert_eq!(
             c["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:9090"

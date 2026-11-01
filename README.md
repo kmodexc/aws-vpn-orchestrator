@@ -378,18 +378,23 @@ lines of `sing-box.service` since its last report. The dashboard shows this in t
 
 - **Ingress health** — last report (a warning after 25 minutes without one), connections,
   traffic of the last 24 h, version/uptime, current log level. Here an admin can raise the
-  sing-box log level (`info`, `debug`, `trace`) for 1–1440 minutes; it reverts to `warn` on its
+  sing-box log level (`info` or `debug`) for 1–60 minutes; it reverts to `warn` on its
   own. The ingress applies the change within about a minute (the report reply tells it to
-  re-pull its config), as it does for the protocol settings.
+  re-pull its config), as it does for the protocol settings. **Every config change restarts
+  sing-box on the ingress** (it has no live reload): active connections drop for a few seconds,
+  also at the automatic revert. Clients reconnect by themselves.
 - **Ingress log** — live tail of the reported lines with a filter. At `warn` only problems
   appear. **At `info` and above every connection is logged with the client's address and its
   destination**, i.e. the browsing activity of everyone using the VPN — which is why the level
   is timed and why the control plane keeps these lines in memory only (last 2000 lines, gone on
-  restart, never in `state.json` or the app's own logs).
+  restart, discarded one hour after debug logging ends, never in `state.json` or the app's own
+  logs).
 
 Counters are read from sing-box's Clash-compatible API on the ingress, bound to `127.0.0.1` with
-a secret derived from `INGRESS_TOKEN`; no new port is opened. Only the ingress talks to the
-control plane, never the other way round.
+a secret derived from `INGRESS_TOKEN`; no new port is opened, and the served config rejects
+proxied connections to private and loopback addresses, so VPN users cannot reach that API (or
+the VPC) through the tunnel. Only the ingress talks to the control plane, never the other way
+round.
 
 **Ingress created before this existed?** Install the reporter by re-running the bootstrap script
 on it once (idempotent; SSH is open from the IP you ran `setup-lightsail.sh` from):

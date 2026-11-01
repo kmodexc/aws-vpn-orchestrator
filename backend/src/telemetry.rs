@@ -1,7 +1,8 @@
 //! What the ingress reports about itself (`POST /i/{token}/report`, once a minute): a few
 //! counters and its recent sing-box log lines. Kept **in memory only** — the log lines can
 //! contain client addresses and destinations while debug logging is on, and that must not end up
-//! on disk. Everything here is gone after a restart; the next report refills it.
+//! on disk. Everything here is gone after a restart; the next report refills it. Lines collected
+//! during debug logging are purged [`LOG_RETENTION_AFTER_DEBUG_S`] after it ends.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -17,6 +18,8 @@ pub const MAX_LINES_PER_REPORT: usize = 400;
 pub const MAX_LINE_CHARS: usize = 1000;
 /// Hourly traffic buckets kept (48 h).
 const MAX_HOURS: usize = 48;
+/// How long the buffered lines survive after debug logging ended (time to read them).
+pub const LOG_RETENTION_AFTER_DEBUG_S: i64 = 3600;
 
 /// The report body sent by the ingress. Unknown fields are rejected.
 #[derive(Debug, Deserialize)]
@@ -28,7 +31,7 @@ pub struct IngressReport {
     pub uptime_s: Option<u64>,
     /// Active proxied connections; `None` when sing-box or its API is unreachable.
     pub connections: Option<u32>,
-    /// Cumulative bytes since sing-box started (reset on restart).
+    /// Cumulative bytes since sing-box started (reset on restart). `None` = not read this time.
     pub upload_total: Option<u64>,
     pub download_total: Option<u64>,
     /// Lowercase hex SHA-256 of the config file the ingress currently runs.
@@ -54,6 +57,18 @@ pub struct LogLine {
     pub text: String,
 }
 
+/// A page of log lines for the dashboard.
+#[derive(Debug, Serialize)]
+pub struct LogChunk {
+    pub lines: Vec<LogLine>,
+    /// Pass as `after` next time to get only newer lines.
+    pub next: u64,
+    pub dropped: u64,
+    /// Identifies this buffer's lifetime; it changes when the control plane restarts (sequence
+    /// numbers start over) or the buffer is cleared, so a client knows to start from 0.
+    pub epoch: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HourBucket {
     /// Start of the hour, unix seconds.
@@ -77,6 +92,8 @@ pub struct Snapshot {
     pub config_sha256: Option<String>,
     pub log_lines: usize,
     pub log_dropped: u64,
+    /// When the buffered lines will be discarded, if a purge is scheduled.
+    pub log_purge_at: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +102,8 @@ struct Inner {
     version: Option<String>,
     uptime_s: Option<u64>,
     connections: Option<u32>,
+    /// Last *known* totals; a report without them leaves these untouched, so the next delta is
+    /// still computed against the previous reading and not against zero.
     upload_total: Option<u64>,
     download_total: Option<u64>,
     config_sha256: Option<String>,
@@ -93,11 +112,19 @@ struct Inner {
     next_seq: u64,
     /// Lines dropped anywhere (by the ingress, or here when the buffer was full).
     log_dropped: u64,
+    epoch: u64,
+    purge_at: Option<i64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Telemetry {
     inner: Mutex<Inner>,
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self::with_epoch(unix_now().unsigned_abs())
+    }
 }
 
 /// Keep a journal line printable and bounded. Control characters (incl. ANSI escapes) are
@@ -120,19 +147,46 @@ fn delta(prev: Option<u64>, now: Option<u64>) -> u64 {
         // Counter went backwards: sing-box restarted, the new total is the delta.
         (Some(p), Some(n)) => n.checked_sub(p).unwrap_or(n),
         (None, Some(n)) => n,
-        _ => 0,
+        // Not read this time: attribute nothing; the next reading carries the growth.
+        (_, None) => 0,
+    }
+}
+
+impl Inner {
+    fn clear_logs(&mut self) {
+        self.logs.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        self.purge_at = None;
+    }
+
+    fn purge_if_due(&mut self, now: i64) {
+        if self.purge_at.is_some_and(|at| at <= now) && !self.logs.is_empty() {
+            self.clear_logs();
+        } else if self.purge_at.is_some_and(|at| at <= now) {
+            self.purge_at = None;
+        }
     }
 }
 
 impl Telemetry {
+    pub fn with_epoch(epoch: u64) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                epoch,
+                ..Inner::default()
+            }),
+        }
+    }
+
     pub fn record(&self, report: IngressReport) {
         self.record_at(report, unix_now());
     }
 
     pub fn record_at(&self, report: IngressReport, now: i64) {
         let mut t = lock(&self.inner);
+        t.purge_if_due(now);
 
-        // Traffic: attribute the growth since the previous report to the current hour.
+        // Traffic: attribute the growth since the previous reading to the current hour.
         let up = delta(t.upload_total, report.upload_total);
         let down = delta(t.download_total, report.download_total);
         let hour = now - now.rem_euclid(3600);
@@ -157,8 +211,12 @@ impl Telemetry {
         t.version = Some(crate::util::sanitize_text(&report.version, 32));
         t.uptime_s = report.uptime_s;
         t.connections = report.connections;
-        t.upload_total = report.upload_total;
-        t.download_total = report.download_total;
+        if report.upload_total.is_some() {
+            t.upload_total = report.upload_total;
+        }
+        if report.download_total.is_some() {
+            t.download_total = report.download_total;
+        }
         t.config_sha256 = Some(report.config_sha256);
 
         // Logs: newest MAX_LINES_PER_REPORT of this report, then the buffer cap.
@@ -187,7 +245,8 @@ impl Telemetry {
     }
 
     pub fn snapshot_at(&self, now: i64) -> Snapshot {
-        let t = lock(&self.inner);
+        let mut t = lock(&self.inner);
+        t.purge_if_due(now);
         let since = now - 24 * 3600;
         let (upload_24h, download_24h) = t
             .hours
@@ -208,26 +267,49 @@ impl Telemetry {
             config_sha256: t.config_sha256.clone(),
             log_lines: t.logs.len(),
             log_dropped: t.log_dropped,
+            log_purge_at: t.purge_at,
         }
     }
 
-    /// Lines with `seq >= after`, oldest first, at most `limit`.
-    pub fn logs_after(&self, after: u64, limit: usize) -> Vec<LogLine> {
-        let t = lock(&self.inner);
+    /// Lines with `seq >= after`, oldest first, at most `limit` — plus the cursor for the next
+    /// call, all read under one lock so a report landing in between cannot be skipped.
+    pub fn chunk(&self, after: u64, limit: usize) -> LogChunk {
+        self.chunk_at(after, limit, unix_now())
+    }
+
+    pub fn chunk_at(&self, after: u64, limit: usize, now: i64) -> LogChunk {
+        let mut t = lock(&self.inner);
+        t.purge_if_due(now);
         // seq is monotonic and contiguous within the buffer: binary-search the start.
         let start = t.logs.partition_point(|l| l.seq < after);
-        t.logs.iter().skip(start).take(limit).cloned().collect()
+        let lines: Vec<LogLine> = t.logs.iter().skip(start).take(limit).cloned().collect();
+        // Everything before `next` has been handed out; a client that asked beyond the end
+        // gets the real end, so it never waits for sequence numbers that will not come.
+        let next = lines.last().map_or(t.next_seq, |l| l.seq + 1);
+        LogChunk {
+            lines,
+            next,
+            dropped: t.log_dropped,
+            epoch: t.epoch,
+        }
     }
 
-    /// The next sequence number a new line will get (so a client can start "from now").
-    pub fn next_seq(&self) -> u64 {
-        lock(&self.inner).next_seq
-    }
-
-    /// Forget all log lines (the counters stay). Used when debug logging is switched off.
-    pub fn clear_logs(&self) {
+    /// Forget all log lines now (the counters stay). Starts a new epoch.
+    pub fn clear_logs(&self) -> LogChunk {
         let mut t = lock(&self.inner);
-        t.logs.clear();
+        t.clear_logs();
+        LogChunk {
+            lines: Vec::new(),
+            next: t.next_seq,
+            dropped: t.log_dropped,
+            epoch: t.epoch,
+        }
+    }
+
+    /// Discard the buffered lines at `at` (unix s). Called whenever debug logging is set or
+    /// ended, so connection records never linger beyond the retention period.
+    pub fn schedule_purge(&self, at: i64) {
+        lock(&self.inner).purge_at = Some(at);
     }
 }
 
@@ -250,7 +332,7 @@ mod tests {
 
     #[test]
     fn traffic_is_attributed_per_hour_and_survives_counter_resets() {
-        let t = Telemetry::default();
+        let t = Telemetry::with_epoch(1);
         let h0 = 1_700_000_000 - (1_700_000_000 % 3600);
         t.record_at(report(Some(100), Some(1000), vec![]), h0 + 10);
         t.record_at(report(Some(150), Some(1500), vec![]), h0 + 70);
@@ -267,8 +349,25 @@ mod tests {
     }
 
     #[test]
+    fn a_report_without_totals_does_not_inflate_traffic() {
+        let t = Telemetry::with_epoch(1);
+        let h0 = 1_700_000_000 - (1_700_000_000 % 3600);
+        t.record_at(report(Some(500), Some(500), vec![]), h0 + 10);
+        // stats API unreachable this minute
+        t.record_at(report(None, None, vec![]), h0 + 70);
+        let s = t.snapshot_at(h0 + 80);
+        assert_eq!(s.upload_total, Some(500), "last known total is kept");
+        assert_eq!(s.connections, Some(2));
+        // next reading: only the growth counts, not the whole counter
+        t.record_at(report(Some(510), Some(520), vec![]), h0 + 130);
+        let s = t.snapshot_at(h0 + 140);
+        assert_eq!(s.upload_24h, 510);
+        assert_eq!(s.download_24h, 520);
+    }
+
+    #[test]
     fn logs_are_bounded_sequenced_and_sanitized() {
-        let t = Telemetry::default();
+        let t = Telemetry::with_epoch(7);
         t.record_at(
             report(
                 None,
@@ -277,14 +376,18 @@ mod tests {
             ),
             1,
         );
-        let lines = t.logs_after(0, 10);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].text, "a[31mred[0m");
-        assert_eq!(lines[1].text, "b c");
-        assert_eq!(lines[1].seq, 1);
-        assert_eq!(t.logs_after(1, 10).len(), 1);
-        assert_eq!(t.logs_after(5, 10).len(), 0);
-        assert_eq!(t.next_seq(), 2);
+        let c = t.chunk_at(0, 10, 1);
+        assert_eq!(c.lines.len(), 2);
+        assert_eq!(c.lines[0].text, "a[31mred[0m");
+        assert_eq!(c.lines[1].text, "b c");
+        assert_eq!(c.lines[1].seq, 1);
+        assert_eq!(c.next, 2);
+        assert_eq!(c.epoch, 7);
+        assert_eq!(t.chunk_at(1, 10, 1).lines.len(), 1);
+        // asking beyond the end returns the real end, not the caller's cursor
+        let c = t.chunk_at(5, 10, 1);
+        assert_eq!(c.lines.len(), 0);
+        assert_eq!(c.next, 2);
 
         // Per report only the newest MAX_LINES_PER_REPORT lines are kept.
         let many: Vec<String> = (0..(MAX_LINES_PER_REPORT + 50))
@@ -294,7 +397,7 @@ mod tests {
         let s = t.snapshot_at(3);
         assert_eq!(s.log_lines, 2 + MAX_LINES_PER_REPORT);
         assert_eq!(s.log_dropped, 50);
-        assert_eq!(t.logs_after(2, 1)[0].text, "50");
+        assert_eq!(t.chunk_at(2, 1, 3).lines[0].text, "50");
 
         // The buffer itself is capped; the oldest lines go.
         let reports = MAX_LOG_LINES / MAX_LINES_PER_REPORT + 1;
@@ -308,17 +411,35 @@ mod tests {
         assert_eq!(s.log_lines, MAX_LOG_LINES);
         let pushed_out = 2 + MAX_LINES_PER_REPORT + reports * MAX_LINES_PER_REPORT - MAX_LOG_LINES;
         assert_eq!(s.log_dropped, 50 + pushed_out as u64);
-        let last = t.logs_after(0, usize::MAX);
-        assert_eq!(last.len(), MAX_LOG_LINES);
+        let last = t.chunk_at(0, usize::MAX, 5);
+        assert_eq!(last.lines.len(), MAX_LOG_LINES);
         assert_eq!(
-            last.last().unwrap().text,
+            last.lines.last().unwrap().text,
             format!("r{}-{}", reports - 1, MAX_LINES_PER_REPORT - 1)
         );
         // sequence numbers stay contiguous across the pops
-        assert_eq!(last[1].seq, last[0].seq + 1);
+        assert_eq!(last.lines[1].seq, last.lines[0].seq + 1);
 
-        t.clear_logs();
-        assert_eq!(t.snapshot_at(4).log_lines, 0);
+        // clearing starts a new epoch
+        let c = t.clear_logs();
+        assert_eq!(c.epoch, 8);
+        assert_eq!(t.snapshot_at(6).log_lines, 0);
+    }
+
+    #[test]
+    fn scheduled_purge_discards_lines_after_the_retention() {
+        let t = Telemetry::with_epoch(1);
+        t.record_at(report(None, None, vec!["x".into()]), 100);
+        t.schedule_purge(200);
+        assert_eq!(t.snapshot_at(199).log_lines, 1);
+        assert_eq!(t.snapshot_at(199).log_purge_at, Some(200));
+        let c = t.chunk_at(0, 10, 200);
+        assert!(c.lines.is_empty());
+        assert_eq!(c.epoch, 2, "a purge is a new epoch");
+        assert_eq!(t.snapshot_at(201).log_purge_at, None);
+        // lines arriving after the purge are kept again
+        t.record_at(report(None, None, vec!["y".into()]), 300);
+        assert_eq!(t.chunk_at(0, 10, 300).lines[0].text, "y");
     }
 
     #[test]

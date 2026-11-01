@@ -86,8 +86,11 @@ fn is_public_host_name(s: &str) -> bool {
 
 /// Default sing-box log level: errors and warnings only — no connection records on the ingress.
 pub const DEFAULT_LOG_LEVEL: &str = "warn";
-pub const DEBUG_LOG_LEVELS: [&str; 3] = ["info", "debug", "trace"];
-pub const MAX_DEBUG_MINUTES: u32 = 24 * 60;
+/// `trace` is deliberately not offered: it adds nothing for debugging a VPN and multiplies the
+/// volume of connection records.
+pub const DEBUG_LOG_LEVELS: [&str; 2] = ["info", "debug"];
+/// A debug window is short by design: every minute at `info` records who connected where.
+pub const MAX_DEBUG_MINUTES: u32 = 60;
 
 /// A temporary, more verbose sing-box log level. `info` and above log every connection with
 /// client address and destination, so it always expires by itself.
@@ -109,10 +112,10 @@ impl DebugLogRequest {
     pub fn validate(self, now: i64) -> Result<DebugLog, &'static str> {
         let level = self.level.trim().to_ascii_lowercase();
         if !DEBUG_LOG_LEVELS.contains(&level.as_str()) {
-            return Err("level must be info, debug or trace");
+            return Err("level must be info or debug");
         }
         if self.minutes == 0 || self.minutes > MAX_DEBUG_MINUTES {
-            return Err("minutes must be between 1 and 1440");
+            return Err("minutes must be between 1 and 60");
         }
         Ok(DebugLog {
             level,
@@ -121,10 +124,18 @@ impl DebugLogRequest {
     }
 }
 
-/// The log level to serve now: the debug level while it lasts, else the default.
+/// The log level to serve now: the debug level while it lasts, else the default. A stored window
+/// longer than the maximum (a tampered `state.json`) counts as no window.
 pub fn log_level(debug: Option<&DebugLog>, now: i64) -> &str {
+    let max_until = now + i64::from(MAX_DEBUG_MINUTES) * 60;
     match debug {
-        Some(d) if d.until > now && DEBUG_LOG_LEVELS.contains(&d.level.as_str()) => &d.level,
+        Some(d)
+            if d.until > now
+                && d.until <= max_until
+                && DEBUG_LOG_LEVELS.contains(&d.level.as_str()) =>
+        {
+            &d.level
+        }
         _ => DEFAULT_LOG_LEVEL,
     }
 }
@@ -214,7 +225,13 @@ mod tests {
         assert_eq!(log_level(Some(&d), 1000), "info");
         assert_eq!(log_level(Some(&d), 1000 + 30 * 60), "warn");
         assert_eq!(log_level(None, 0), "warn");
-        for (level, minutes) in [("warn", 10), ("error", 10), ("info", 0), ("info", 1441)] {
+        for (level, minutes) in [
+            ("warn", 10),
+            ("error", 10),
+            ("trace", 10),
+            ("info", 0),
+            ("info", 61),
+        ] {
             assert!(
                 DebugLogRequest {
                     level: level.into(),
@@ -231,5 +248,10 @@ mod tests {
             until: i64::MAX,
         };
         assert_eq!(log_level(Some(&bogus), 0), "warn");
+        let too_long = DebugLog {
+            level: "info".into(),
+            until: 10 + i64::from(MAX_DEBUG_MINUTES) * 60 + 1,
+        };
+        assert_eq!(log_level(Some(&too_long), 10), "warn");
     }
 }

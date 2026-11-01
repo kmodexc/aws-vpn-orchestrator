@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::app::AppState;
 use crate::error::{plain_not_found, plain_status};
+use crate::http::api::is_json;
 use crate::http::request_context::ClientIp;
 use crate::singbox;
 use crate::telemetry::{IngressReport, ReportReply};
@@ -81,14 +82,6 @@ pub async fn ingress_config(
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
-}
-
-fn is_json(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// The ingress reports counters and new log lines (SPEC §5). Plain-text errors like the other

@@ -17,7 +17,7 @@ use crate::error::ApiError;
 use crate::settings::{DebugLog, DebugLogRequest, ProtocolSettings, SettingsUpdate, log_level};
 use crate::singbox;
 use crate::state::{Event, EventAction};
-use crate::telemetry::{LogLine, MAX_LOG_LINES, Snapshot};
+use crate::telemetry::{LOG_RETENTION_AFTER_DEBUG_S, LogChunk, MAX_LOG_LINES, Snapshot};
 use crate::util::{sanitize_text, unix_now};
 
 pub const MAX_EVENTS_LIMIT: usize = 200;
@@ -66,7 +66,7 @@ pub struct RotateRequest {
     pub reason: Option<String>,
 }
 
-fn is_json(headers: &HeaderMap) -> bool {
+pub(crate) fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -383,41 +383,20 @@ pub struct LogsQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct LogsResponse {
-    pub lines: Vec<LogLine>,
-    /// Pass as `after` next time to get only newer lines.
-    pub next: u64,
-    pub dropped: u64,
-}
-
 pub async fn logs(
     State(state): State<AppState>,
     _p: Admin,
     query: Result<Query<LogsQuery>, QueryRejection>,
-) -> Result<Json<LogsResponse>, ApiError> {
+) -> Result<Json<LogChunk>, ApiError> {
     let Query(q) =
         query.map_err(|_| ApiError::BadRequest("after and limit must be non-negative integers"))?;
     let after = q.after.unwrap_or(0);
     let limit = q.limit.unwrap_or(MAX_LOG_LINES).clamp(1, MAX_LOG_LINES);
-    let lines = state.telemetry.logs_after(after, limit);
-    let next = lines
-        .last()
-        .map_or_else(|| after.max(state.telemetry.next_seq()), |l| l.seq + 1);
-    Ok(Json(LogsResponse {
-        lines,
-        next,
-        dropped: state.telemetry.snapshot().log_dropped,
-    }))
+    Ok(Json(state.telemetry.chunk(after, limit)))
 }
 
-pub async fn clear_logs(State(state): State<AppState>, _p: Admin) -> Json<LogsResponse> {
-    state.telemetry.clear_logs();
-    Json(LogsResponse {
-        lines: Vec::new(),
-        next: state.telemetry.next_seq(),
-        dropped: 0,
-    })
+pub async fn clear_logs(State(state): State<AppState>, _p: Admin) -> Json<LogChunk> {
+    Json(state.telemetry.clear_logs())
 }
 
 async fn store_debug_log(
@@ -466,6 +445,10 @@ pub async fn put_debug_log(
     let minutes = req.minutes;
     let debug = req.validate(unix_now()).map_err(ApiError::BadRequest)?;
     let detail = format!("sing-box log level {} for {minutes} min", debug.level);
+    // Connection records collected meanwhile are discarded a while after the level reverts.
+    state
+        .telemetry
+        .schedule_purge(debug.until + LOG_RETENTION_AFTER_DEBUG_S);
     store_debug_log(&state, p.actor(), Some(debug), detail).await?;
     Ok(Json(telemetry_response(&state).await))
 }
@@ -481,6 +464,9 @@ pub async fn clear_debug_log(
         "sing-box log level back to warn".into(),
     )
     .await?;
+    state
+        .telemetry
+        .schedule_purge(unix_now() + LOG_RETENTION_AFTER_DEBUG_S);
     Ok(Json(telemetry_response(&state).await))
 }
 

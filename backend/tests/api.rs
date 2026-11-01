@@ -1349,6 +1349,8 @@ async fn ingress_reports_feed_telemetry_and_logs() {
     assert_eq!(l["lines"][0]["text"], "first [31mline[0m");
     assert_eq!(l["lines"][1]["seq"], 1);
     assert_eq!(l["next"], 2);
+    assert!(l["epoch"].is_u64());
+    let epoch = l["epoch"].clone();
     let l = body_json(
         app.get_with_session("/api/ingress/logs?after=2", &cookie)
             .await,
@@ -1356,6 +1358,14 @@ async fn ingress_reports_feed_telemetry_and_logs() {
     .await;
     assert_eq!(l["lines"].as_array().unwrap().len(), 0);
     assert_eq!(l["next"], 2);
+    // a cursor from a previous life of the server does not stall the client
+    let l = body_json(
+        app.get_with_session("/api/ingress/logs?after=999", &cookie)
+            .await,
+    )
+    .await;
+    assert_eq!(l["next"], 2);
+    assert_eq!(l["epoch"], epoch);
 
     // the log level is raised through the UI; the served config changes and the report
     // reply flags the old hash as stale
@@ -1374,6 +1384,11 @@ async fn ingress_reports_feed_telemetry_and_logs() {
     let t = body_json(resp).await;
     assert_eq!(t["log_level"], "info");
     assert!(t["debug_log"]["until"].as_i64().unwrap() > t["now"].as_i64().unwrap());
+    // the lines collected meanwhile are scheduled to be discarded after the level reverts
+    assert_eq!(
+        t["report"]["log_purge_at"].as_i64().unwrap(),
+        t["debug_log"]["until"].as_i64().unwrap() + 3600
+    );
     let cfg = body_json(
         app.get(&format!("/i/{}/config.json", app.ingress_token))
             .await,
@@ -1463,6 +1478,11 @@ async fn ingress_reports_feed_telemetry_and_logs() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_ne!(
+        body_json(resp).await["epoch"],
+        epoch,
+        "clearing starts a new epoch"
+    );
     let t = body_json(
         app.get_with_session("/api/ingress/telemetry", &cookie)
             .await,

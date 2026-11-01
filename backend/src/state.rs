@@ -115,6 +115,12 @@ impl StateStore {
         })
     }
 
+    /// A copy of the current state without awaiting — for startup code, before any task runs.
+    /// Falls back to the default if the lock is (unexpectedly) held.
+    pub fn peek(&self) -> PersistedState {
+        self.data.try_lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
     /// A copy of the current state.
     pub async fn snapshot(&self) -> PersistedState {
         self.data.lock().await.clone()

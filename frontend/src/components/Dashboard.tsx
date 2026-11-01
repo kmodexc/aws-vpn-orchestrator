@@ -48,6 +48,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
   const [wg, setWg] = useState<WireGuard | null>(null);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [telemetryAt, setTelemetryAt] = useState(0);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState<Action | null>(null);
@@ -73,7 +74,9 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
 
   const loadTelemetry = useCallback(async () => {
     try {
-      setTelemetry(await api.telemetry());
+      const t = await api.telemetry();
+      setTelemetry(t);
+      setTelemetryAt(Date.now());
       setTelemetryError(null);
     } catch (e) {
       setTelemetryError(describeError(e));
@@ -235,8 +238,10 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
           telemetry={telemetry}
           error={telemetryError}
           now={slowNow}
+          fetchedAt={telemetryAt}
           onChanged={(t) => {
             setTelemetry(t);
+            setTelemetryAt(Date.now());
             manualRefresh();
           }}
         />

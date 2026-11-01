@@ -7,7 +7,10 @@ interface Props {
   api: ApiClient;
   telemetry: Telemetry | null;
   error: string | null;
+  /** Browser time (ms) of the last render tick. */
   now: number;
+  /** Browser time (ms) when `telemetry` was fetched, to carry the server clock forward. */
+  fetchedAt: number;
   /** Called after the log level was changed (so the dashboard refreshes at once). */
   onChanged: (t: Telemetry) => void;
 }
@@ -18,10 +21,9 @@ const STALE_AFTER_S = 25 * 60;
 const LEVELS: { value: DebugLogLevel; label: string }[] = [
   { value: "info", label: "info — connections, reloads, errors" },
   { value: "debug", label: "debug — plus handshake details (noisy)" },
-  { value: "trace", label: "trace — everything (very noisy)" },
 ];
 
-export function IngressCard({ api, telemetry, error, now, onChanged }: Props) {
+export function IngressCard({ api, telemetry, error, now, fetchedAt, onChanged }: Props) {
   const [level, setLevel] = useState<DebugLogLevel>("info");
   const [minutes, setMinutes] = useState(60);
   const [busy, setBusy] = useState(false);
@@ -61,9 +63,12 @@ export function IngressCard({ api, telemetry, error, now, onChanged }: Props) {
       );
   }
 
+  // Everything about the debug window is judged on the server's clock, carried forward by the
+  // time elapsed since the fetch (the browser clock may be skewed).
+  const serverNowS = telemetry === null ? nowS : telemetry.now + (now - fetchedAt) / 1000;
   const debug = telemetry?.debug_log ?? null;
-  const debugActive = telemetry !== null && debug !== null && debug.until > telemetry.now;
-  const debugLeftS = debug !== null ? debug.until - nowS : 0;
+  const debugLeftS = debug === null ? 0 : debug.until - serverNowS;
+  const debugActive = debugLeftS > 0;
 
   return (
     <section className="card" aria-labelledby="ingress-title">
@@ -109,7 +114,9 @@ export function IngressCard({ api, telemetry, error, now, onChanged }: Props) {
       >
         <p className="muted small">
           Debug logging records every connection with client address and destination on the
-          ingress and shows it below. It switches itself off; keep it short.
+          ingress and shows it below. It switches itself off; keep it short. Any level change —
+          including the automatic revert — restarts sing-box on the ingress, so active VPN
+          connections drop for a few seconds.
         </p>
         <div className="inline-fields">
           <div className="field">
@@ -134,7 +141,7 @@ export function IngressCard({ api, telemetry, error, now, onChanged }: Props) {
               id={minutesId}
               type="number"
               min={1}
-              max={1440}
+              max={60}
               required
               value={minutes}
               onChange={(e) => {

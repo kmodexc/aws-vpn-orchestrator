@@ -87,7 +87,7 @@ export interface SettingsResponse {
   ports: { vless_tcp: number; hy2_udp: number; ss: number };
 }
 
-export type DebugLogLevel = "info" | "debug" | "trace";
+export type DebugLogLevel = "info" | "debug";
 
 /** What the ingress last reported (`/api/ingress/telemetry`). */
 export interface Telemetry {
@@ -103,6 +103,7 @@ export interface Telemetry {
     config_sha256: string | null;
     log_lines: number;
     log_dropped: number;
+    log_purge_at: number | null;
   };
   debug_log: { level: string; until: number } | null;
   /** Level in the config served right now. */
@@ -120,6 +121,8 @@ export interface LogChunk {
   lines: LogLine[];
   next: number;
   dropped: number;
+  /** Changes when the server restarted or the buffer was cleared: start again from 0. */
+  epoch: number;
 }
 
 export interface LogoutResponse {
@@ -448,7 +451,8 @@ function parseReport(v: unknown): Telemetry["report"] {
     isInt(v.download_24h) &&
     isStringOrNull(v.config_sha256) &&
     isInt(v.log_lines) &&
-    isInt(v.log_dropped)
+    isInt(v.log_dropped) &&
+    isIntOrNull(v.log_purge_at)
   ) {
     return {
       last_report_at: v.last_report_at,
@@ -462,6 +466,7 @@ function parseReport(v: unknown): Telemetry["report"] {
       config_sha256: v.config_sha256,
       log_lines: v.log_lines,
       log_dropped: v.log_dropped,
+      log_purge_at: v.log_purge_at,
     };
   }
   return bad();
@@ -493,12 +498,14 @@ export function parseLogs(v: unknown): LogChunk {
     Array.isArray(v.lines) &&
     isInt(v.next) &&
     isInt(v.dropped) &&
+    isInt(v.epoch) &&
     v.lines.every((l: unknown) => isObject(l) && isInt(l.seq) && isString(l.text))
   ) {
     return {
       lines: (v.lines as { seq: number; text: string }[]).map((l) => ({ seq: l.seq, text: l.text })),
       next: v.next,
       dropped: v.dropped,
+      epoch: v.epoch,
     };
   }
   return bad();
@@ -614,8 +621,8 @@ export class ApiClient {
   /** Raise the ingress' sing-box log level for `minutes`; it reverts to warn by itself. */
   async setDebugLog(level: DebugLogLevel, minutes: number): Promise<Telemetry> {
     const m = Math.floor(minutes);
-    if (!Number.isFinite(m) || m < 1 || m > 1440) {
-      throw new ApiError(0, "bad_request", "Minutes must be between 1 and 1440.");
+    if (!Number.isFinite(m) || m < 1 || m > 60) {
+      throw new ApiError(0, "bad_request", "Minutes must be between 1 and 60.");
     }
     return parseTelemetry(await this.send("PUT", "/api/settings/debug-log", { level, minutes: m }));
   }
