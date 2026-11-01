@@ -63,8 +63,8 @@ pub struct OidcConfig {
     pub client_secret: Secret<String>,
     /// Role for full access (admin).
     pub required_role: String,
-    /// Role that may only sign in and read the subscription.
-    pub user_role: String,
+    /// Role that may only sign in and read the subscription. `None`: no such role (default).
+    pub user_role: Option<String>,
     pub allowed_clients: Vec<String>,
     pub scopes: String,
 }
@@ -372,12 +372,15 @@ fn parse_oidc<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<OidcConfig,
         ));
     }
     let required_role = env.or("OIDC_REQUIRED_ROLE", "vpn-admin");
-    let user_role = env.or("OIDC_USER_ROLE", "vpn-user");
-    if user_role.len() > 255 || user_role.chars().any(char::is_control) {
-        return Err(err("OIDC_USER_ROLE", "must be a short name"));
-    }
-    if user_role == required_role {
-        return Err(err("OIDC_USER_ROLE", "must differ from OIDC_REQUIRED_ROLE"));
+    // Opt-in: unset or empty means there is no subscription-only role.
+    let user_role = Some(env.or("OIDC_USER_ROLE", "").trim().to_string()).filter(|r| !r.is_empty());
+    if let Some(r) = &user_role {
+        if r.len() > 255 || r.chars().any(char::is_control) {
+            return Err(err("OIDC_USER_ROLE", "must be a short name"));
+        }
+        if *r == required_role {
+            return Err(err("OIDC_USER_ROLE", "must differ from OIDC_REQUIRED_ROLE"));
+        }
     }
     if required_role.len() > 255 || required_role.chars().any(char::is_control) {
         return Err(err(
@@ -860,7 +863,18 @@ pub(crate) mod tests {
         assert_eq!(c.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(c.oidc.allowed_clients, vec!["vpn-control".to_string()]);
         assert_eq!(c.oidc.required_role, "vpn-admin");
-        assert_eq!(c.oidc.user_role, "vpn-user");
+        assert_eq!(c.oidc.user_role, None);
+        let with_user = Config::from_pairs(
+            valid_pairs()
+                .into_iter()
+                .chain([("OIDC_USER_ROLE".to_string(), " vpn-user ".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(with_user.oidc.user_role.as_deref(), Some("vpn-user"));
+        assert_eq!(
+            error_var(&[("OIDC_USER_ROLE", "vpn-admin")]),
+            "OIDC_USER_ROLE"
+        );
         assert_eq!(c.proxy.ss_port, 8443);
         assert_eq!(c.profile_name, "travel");
         assert!(!c.wireguard.enabled);

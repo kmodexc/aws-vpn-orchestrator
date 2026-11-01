@@ -98,7 +98,8 @@ Follow [docs/keycloak.md](docs/keycloak.md): create the confidential client
 (`https://<DOMAIN>/auth/callback` as the only redirect URI), the realm role `vpn-admin`, assign it
 to your user and enable 2FA. Note the **issuer URL**, **client id** and **client secret**.
 For people who should only *use* the VPN, create a second role `vpn-user`: they sign in and see
-just the subscription to join, with no controls (`OIDC_USER_ROLE`).
+just the subscription to join, with no controls. It is off until you set `OIDC_USER_ROLE=vpn-user`
+in `.env`.
 
 ### 4. Generate `.env`
 

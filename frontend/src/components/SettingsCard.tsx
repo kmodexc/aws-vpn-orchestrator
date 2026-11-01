@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useCallback, useId, useState } from "react";
 import { describeError, type ApiClient, type ProtocolSettings, type SettingsResponse } from "../api";
 
 interface Props {
@@ -34,25 +34,22 @@ export function SettingsCard({ api, onSaved }: Props) {
   const obfsId = useId();
   const ssId = useId();
 
-  // Fetch lazily, once, when the card is first opened (re-opening keeps unsaved edits).
-  useEffect(() => {
-    if (!open || data !== null) return undefined;
-    let cancelled = false;
+  const dirty = data !== null && draft !== null && !sameSettings(data.settings, draft);
+
+  // Loaded when the card is opened (every time, so changes made elsewhere show up), unless
+  // there are unsaved edits to keep.
+  const load = useCallback(() => {
     api.settings().then(
       (s) => {
-        if (cancelled) return;
         setData(s);
         setDraft(s.settings);
         setError(null);
       },
       (e: unknown) => {
-        if (!cancelled) setError(describeError(e));
+        setError(describeError(e));
       },
     );
-    return () => {
-      cancelled = true;
-    };
-  }, [api, open, data]);
+  }, [api]);
 
   const apply = async (action: () => Promise<SettingsResponse>, done: string) => {
     setBusy(true);
@@ -76,7 +73,6 @@ export function SettingsCard({ api, onSaved }: Props) {
     setNotice(null);
   };
 
-  const dirty = data !== null && draft !== null && !sameSettings(data.settings, draft);
 
   return (
     <section className="card" aria-labelledby="settings-title">
@@ -90,7 +86,9 @@ export function SettingsCard({ api, onSaved }: Props) {
           aria-expanded={open}
           aria-controls={bodyId}
           onClick={() => {
-            setOpen((v) => !v);
+            const next = !open;
+            setOpen(next);
+            if (next && !dirty) load();
           }}
         >
           {open ? "Hide" : "Show"}

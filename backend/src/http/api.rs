@@ -286,8 +286,8 @@ fn describe_change(old: &ProtocolSettings, new: &ProtocolSettings) -> String {
 }
 
 /// Store `new` (`None` = back to `.env`) and log the change in the same atomic write. When the
-/// effective settings would not change, nothing is written or logged. Returns the stored
-/// override as it is after this call.
+/// stored override would not change, nothing is written or logged. Returns the stored override
+/// as it is after this call.
 async fn store_settings(
     state: &AppState,
     actor: String,
@@ -298,12 +298,15 @@ async fn store_settings(
         .orchestrator
         .store()
         .update_if(|s| {
-            let old = ProtocolSettings::effective(cfg, s.protocol.as_ref());
-            let next = ProtocolSettings::effective(cfg, new.as_ref());
-            if old == next {
+            if s.protocol == new {
                 return (false, s.protocol.clone());
             }
+            let old = ProtocolSettings::effective(cfg, s.protocol.as_ref());
+            let next = ProtocolSettings::effective(cfg, new.as_ref());
             let mut detail = describe_change(&old, &next);
+            if detail.is_empty() {
+                detail = "no effective change".into();
+            }
             if new.is_none() {
                 detail = format!("reset to .env defaults: {detail}");
             }

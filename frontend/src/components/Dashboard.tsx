@@ -206,7 +206,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
         <SubscriptionCard
           api={api}
           ipKey={status?.public_ip ?? null}
-          settingsVersion={settingsVersion}
+          refreshKey={settingsVersion}
         />
         <SettingsCard
           api={api}

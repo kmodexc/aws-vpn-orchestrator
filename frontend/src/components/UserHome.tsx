@@ -1,4 +1,6 @@
 import type { ApiClient, Me } from "../api";
+import { useNow, usePageVisible } from "../hooks";
+import { SLOW_POLL_MS } from "../time";
 import { SubscriptionCard } from "./SubscriptionCard";
 
 interface Props {
@@ -11,6 +13,10 @@ interface Props {
 
 /** What a user-role account sees: the subscription to join, and nothing else. */
 export function UserHome({ api, me, onLogout, loggingOut, logoutError }: Props) {
+  // No status polling for this role; re-fetch the subscription on a timer instead, so a
+  // rotation shows up here too.
+  const visible = usePageVisible();
+  const tick = useNow(SLOW_POLL_MS, visible);
   return (
     <div className="page">
       <header className="topbar">
@@ -38,7 +44,7 @@ export function UserHome({ api, me, onLogout, loggingOut, logoutError }: Props) 
         </p>
       )}
       <main className="main">
-        <SubscriptionCard api={api} ipKey={null} settingsVersion={0} />
+        <SubscriptionCard api={api} ipKey={null} refreshKey={tick} />
       </main>
     </div>
   );

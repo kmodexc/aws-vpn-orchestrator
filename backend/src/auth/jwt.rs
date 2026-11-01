@@ -59,6 +59,9 @@ pub struct AccessClaims {
 
 impl AccessClaims {
     /// SPEC §4.3: the role is in `realm_access.roles` or `resource_access.<client_id>.roles`.
+    /// Production code decides through [`roles`](Self::roles) (`auth::access_of`); this is
+    /// kept for the claim-parsing tests.
+    #[cfg(test)]
     pub fn has_role(&self, role: &str, client_id: &str) -> bool {
         let realm = self
             .realm_access

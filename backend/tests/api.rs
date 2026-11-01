@@ -272,7 +272,15 @@ async fn api_requires_auth_and_is_not_cached() {
 
 #[tokio::test]
 async fn user_role_sees_only_the_subscription() {
-    let app = app();
+    // Off unless configured: the role grants nothing by default.
+    let plain = app();
+    let (c, _) = plain.login(&["vpn-user"]);
+    assert_eq!(
+        plain.get_with_session("/api/me", &c).await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let app = app_with(&[("OIDC_USER_ROLE", "vpn-user")]);
     let (cookie, csrf) = app.login(&["vpn-user"]);
     let me = body_json(app.get_with_session("/api/me", &cookie).await).await;
     assert_eq!(me["is_admin"], false);
@@ -1172,6 +1180,27 @@ async fn settings_change_the_ingress_config_and_subscription() {
             .unwrap()
             .starts_with("reset to .env defaults: ")
     );
+
+    // an override equal to the .env defaults is still an override, and a reset clears it
+    let defaults =
+        body_json(app.get_with_session("/api/settings", &cookie).await).await["defaults"].clone();
+    let resp = app
+        .put_settings(&cookie, &csrf, &defaults.to_string())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["overridden"], true);
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/settings")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["overridden"], false);
 
     // a reset without an override is a no-op
     let before = app.state.orchestrator.store().snapshot().await;

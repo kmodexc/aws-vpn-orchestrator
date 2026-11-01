@@ -54,7 +54,7 @@ fn access_of<'a>(
         if r == cfg.oidc.required_role {
             return Some(true);
         }
-        if r == cfg.oidc.user_role {
+        if Some(r) == cfg.oidc.user_role.as_deref() {
             user = true;
         }
     }
@@ -121,7 +121,8 @@ pub async fn authenticate(
             state.limiter.record_failure(client_ip);
             return Err(ApiError::Unauthorized);
         };
-        let Some(is_admin) = access_of_claims(cfg, &claims) else {
+        let roles = claims.roles(&cfg.oidc.client_id);
+        let Some(is_admin) = access_of(cfg, roles.iter().map(String::as_str)) else {
             return Err(ApiError::Forbidden);
         };
         return Ok(Principal {
@@ -130,7 +131,7 @@ pub async fn authenticate(
                 .clone()
                 .unwrap_or_else(|| sub.clone()),
             email: claims.email.clone(),
-            roles: claims.roles(&cfg.oidc.client_id),
+            roles,
             sub,
             method: AuthMethod::Bearer,
             is_admin,

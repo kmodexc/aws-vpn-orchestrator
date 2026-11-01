@@ -7,8 +7,8 @@ interface Props {
   api: ApiClient;
   /** Changes whenever the public IP changes, so the links are re-fetched. */
   ipKey: string | null;
-  /** Bumped after the protocol settings were changed: the links change too. */
-  settingsVersion: number;
+  /** Any change re-fetches: bumped after a settings change, or on a timer (user view). */
+  refreshKey: number;
 }
 
 export function linkLabel(link: string, index: number): string {
@@ -42,7 +42,7 @@ function LinkItem({ link, index }: { link: string; index: number }) {
   );
 }
 
-export function SubscriptionCard({ api, ipKey, settingsVersion }: Props) {
+export function SubscriptionCard({ api, ipKey, refreshKey }: Props) {
   const [show, setShow] = useState(false);
   const [showLinks, setShowLinks] = useState(false);
   const [sub, setSub] = useState<Subscription | null>(null);
@@ -70,7 +70,7 @@ export function SubscriptionCard({ api, ipKey, settingsVersion }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [api, visible, ipKey, settingsVersion]);
+  }, [api, visible, ipKey, refreshKey]);
 
   const loading = sub === null && error === null;
 

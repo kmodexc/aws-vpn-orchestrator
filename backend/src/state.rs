@@ -121,13 +121,7 @@ impl StateStore {
     /// never reordered. The in-memory state is updated even if persisting fails (so that e.g.
     /// the rotation cooldown is still enforced); the write error is returned to the caller.
     pub async fn update<R>(&self, f: impl FnOnce(&mut PersistedState) -> R) -> anyhow::Result<R> {
-        let mut guard = self.data.lock().await;
-        let result = f(&mut guard);
-        guard.enforce_caps();
-        let dir = self.dir.clone();
-        let to_write = guard.clone();
-        tokio::task::spawn_blocking(move || write_atomic(&dir, &to_write)).await??;
-        Ok(result)
+        self.update_if(|s| (true, f(s))).await
     }
 
     /// Like [`update`](Self::update), but the closure says whether anything changed; when it

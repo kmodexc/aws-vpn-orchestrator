@@ -74,6 +74,7 @@ The backend binary `vpn-control` has these subcommands (no subcommand = `serve`)
 | `OIDC_CLIENT_ID` | yes | – | confidential client used for the browser login |
 | `OIDC_CLIENT_SECRET` | yes | – | secret |
 | `OIDC_REQUIRED_ROLE` | no | `vpn-admin` | realm role **or** client role of `OIDC_CLIENT_ID` |
+| `OIDC_USER_ROLE` | no | unset (off) | optional subscription-only role (§4.3); must differ from `OIDC_REQUIRED_ROLE` |
 | `OIDC_ALLOWED_CLIENTS` | no | `<OIDC_CLIENT_ID>` | comma list; a Bearer token's `azp` must be in it |
 | `OIDC_SCOPES` | no | `openid profile email` | |
 | `SESSION_IDLE_TIMEOUT_S` | no | `1800` | |
@@ -160,7 +161,7 @@ triggers outbound traffic.
 
 Roles are read from `realm_access.roles` and `resource_access.<OIDC_CLIENT_ID>.roles` of the
 access token. `OIDC_REQUIRED_ROLE` (default `vpn-admin`) grants full access; `OIDC_USER_ROLE`
-(default `vpn-user`) grants sign-in plus `GET /api/me` and `GET /api/subscription` only — enough
+(unset by default — opt-in, e.g. `vpn-user`) grants sign-in plus `GET /api/me` and `GET /api/subscription` only — enough
 to join the VPN, nothing that operates or configures it. A caller with both roles is an admin.
 Authenticated with neither role → 403 (login: `login_error=forbidden`); a user-role caller on an
 admin-only route → 403 `forbidden`.

@@ -47,14 +47,15 @@ If the issuer shows an internal host name or `http://`, Keycloak's hostname conf
 
 Only users with this role may operate vpn-control (`OIDC_REQUIRED_ROLE`, default `vpn-admin`).
 
-**Second role for people who only use the VPN:** create `vpn-user` the same way
-(`OIDC_USER_ROLE`). Such a user can sign in and sees exactly one thing — the subscription URL and
+**Second role for people who only use the VPN:** create `vpn-user` the same way and enable it
+with `OIDC_USER_ROLE=vpn-user` in `.env` (it is off until set). Such a user can sign in and sees exactly one thing — the subscription URL and
 QR code to join — and cannot start, stop or rotate the server, read the event log or change
 settings. Give family or friends this role, never `vpn-admin`. Remember that the subscription is
 one shared secret: removing a person's access later means rotating `SUB_TOKEN`
 (docs/security.md), not just the role.
 
-A user who logs in with neither role gets *"Your account lacks the required role"* (HTTP 403).
+A user who logs in with neither role is sent back to the sign-in page with *"This account has no
+access."* (`login_error=forbidden`).
 
 > Alternatively use a **client role** of the web client (*Clients → console → Roles*); the
 > backend accepts `OIDC_REQUIRED_ROLE` from `realm_access.roles` **or**
