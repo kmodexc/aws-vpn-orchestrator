@@ -34,9 +34,9 @@ export function SettingsCard({ api, onSaved }: Props) {
   const obfsId = useId();
   const ssId = useId();
 
-  // Fetch lazily, when the card is opened.
+  // Fetch lazily, once, when the card is first opened (re-opening keeps unsaved edits).
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open || data !== null) return undefined;
     let cancelled = false;
     api.settings().then(
       (s) => {
@@ -52,7 +52,7 @@ export function SettingsCard({ api, onSaved }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [api, open]);
+  }, [api, open, data]);
 
   const apply = async (action: () => Promise<SettingsResponse>, done: string) => {
     setBusy(true);
@@ -178,13 +178,15 @@ export function SettingsCard({ api, onSaved }: Props) {
                 spellCheck={false}
                 required
                 maxLength={253}
-                disabled={!draft.hysteria2}
                 value={draft.hy2_sni}
                 onChange={(e) => {
                   update({ hy2_sni: e.target.value });
                 }}
               />
-              <span className="field__hint">Default: {data.defaults.hy2_sni}</span>
+              <span className="field__hint">
+                Sent by clients as SNI. The certificate keeps the name it was generated with
+                (clients pin it, not the name). Default: {data.defaults.hy2_sni}
+              </span>
             </div>
 
             <div className="check">

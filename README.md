@@ -97,6 +97,8 @@ sudo ufw enable
 Follow [docs/keycloak.md](docs/keycloak.md): create the confidential client
 (`https://<DOMAIN>/auth/callback` as the only redirect URI), the realm role `vpn-admin`, assign it
 to your user and enable 2FA. Note the **issuer URL**, **client id** and **client secret**.
+For people who should only *use* the VPN, create a second role `vpn-user`: they sign in and see
+just the subscription to join, with no controls (`OIDC_USER_ROLE`).
 
 ### 4. Generate `.env`
 
@@ -222,8 +224,11 @@ Scoping notes:
 - **Lightsail** static IPs are addressed by a random resource UUID, are not taggable, and
   `GetStaticIps` / `AllocateStaticIp` support no resource scoping at all. Static-IP actions are
   therefore limited to the region (`StaticIp/*`); the backend itself only ever releases IPs whose
-  name starts with `vpn-orchestrator-`. Start/stop and attach are pinned to the one instance; the
-  read calls (`GetInstance`, `GetStaticIp`) support no resource scoping and are region-wide.
+  name starts with `vpn-orchestrator-`. Start/stop and attach are pinned to the one instance. The
+  read calls are region-wide: although the Service Authorization Reference lists a resource type
+  for `lightsail:GetInstance`, the API evaluates it against `arn:aws:lightsail:<region>:<account>:*`
+  (observed: `not authorized to perform: lightsail:GetInstance on resource: …:*` with the
+  instance-scoped statement), so an instance ARN never matches.
   ⇒ Do not keep other static IPs you care about in the same account/region.
 - **EC2**: `Describe*` cannot be scoped. Start/stop is pinned to one instance; new Elastic IPs can
   only be created *with* the tag `vpn-orchestrator=managed`; only tagged EIPs can be associated

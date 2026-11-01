@@ -1,9 +1,9 @@
 //! Serves the built SPA from `STATIC_DIR`, with `index.html` as fallback for client-side routes.
 //! `/api`, `/auth`, `/s` and `/i` never fall back to `index.html`.
 //!
-//! Nothing is served without a valid session: an anonymous visitor to a page is redirected to the
-//! IdP login and gets a plain 404 for every file. So the app's code and texts never reach anyone
-//! who is not signed in; the site looks like a bare login portal.
+//! Nothing is served without a valid session: an anonymous visitor to a page gets a bare neutral
+//! page with a sign-in link, and a plain 404 for every file. So the app's code and texts never
+//! reach anyone who is not signed in; the site looks like a generic login portal.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -86,21 +86,29 @@ fn login_error_code(query: Option<&str>) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
-/// Minimal neutral page for a failed sign-in. Redirecting to the IdP again could loop (an SSO
-/// session that keeps failing, e.g. without the required role).
-fn login_error_page(code: &str) -> Response {
-    let message = match code {
-        "denied" => "Sign-in was cancelled.",
-        "forbidden" => "This account has no access.",
-        "unavailable" => "Sign-in is temporarily unavailable. Please try again later.",
-        _ => "Sign-in failed.",
+/// Neutral page for anyone without a session: a title and a sign-in link, nothing else. It is a
+/// page rather than a redirect so that crawlers and probes following redirects do not create
+/// pending logins (bounded table, rate-limited `/auth`). A failed sign-in adds a message; the
+/// page never redirects by itself, so a failing SSO login cannot loop.
+fn landing_page(state: &AppState, return_to: &str, login_error: Option<&str>) -> Response {
+    let message = match login_error {
+        None => "",
+        Some("denied") => "<p>Sign-in was cancelled.</p>",
+        Some("forbidden") => "<p>This account has no access.</p>",
+        Some("unavailable") => "<p>Sign-in is temporarily unavailable. Please try again later.</p>",
+        Some(_) => "<p>Sign-in failed.</p>",
     };
+    let mut href = format!("{}/auth/login", state.config.public_base_url);
+    if return_to != "/" {
+        href.push_str("?return_to=");
+        href.extend(url::form_urlencoded::byte_serialize(return_to.as_bytes()));
+    }
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"robots\" content=\"noindex, nofollow\"><title>Console</title></head>\
-         <body><main><h1>Console</h1><p>{message}</p>\
-         <p><a href=\"/auth/login\">Sign in</a></p></main></body></html>"
+         <body><main><h1>Console</h1>{message}\
+         <p><a href=\"{href}\">Sign in</a></p></main></body></html>"
     );
     let mut resp = (StatusCode::OK, html).into_response();
     let h = resp.headers_mut();
@@ -108,25 +116,6 @@ fn login_error_page(code: &str) -> Response {
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
-}
-
-/// Anonymous request for a page: straight to the IdP login, back to the same page afterwards.
-fn redirect_to_login(state: &AppState, path_and_query: &str) -> Response {
-    let mut location = format!("{}/auth/login", state.config.public_base_url);
-    if path_and_query != "/" {
-        let encoded: String =
-            url::form_urlencoded::byte_serialize(path_and_query.as_bytes()).collect();
-        location.push_str("?return_to=");
-        location.push_str(&encoded);
-    }
-    let Ok(location) = HeaderValue::from_str(&location) else {
-        return plain_not_found();
-    };
-    let mut resp = StatusCode::FOUND.into_response();
-    let h = resp.headers_mut();
-    h.insert(header::LOCATION, location);
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
@@ -149,14 +138,16 @@ pub async fn serve(State(state): State<AppState>, req: Request) -> Response {
         if !spa_fallback_allowed(&path) {
             return plain_not_found();
         }
-        if let Some(code) = login_error_code(req.uri().query()) {
-            return login_error_page(&code);
-        }
-        let target = req
-            .uri()
-            .path_and_query()
-            .map_or_else(|| path.clone(), |pq| pq.as_str().to_owned());
-        return redirect_to_login(&state, &target);
+        let login_error = login_error_code(req.uri().query());
+        // After a failed sign-in, "try again" starts from the home page.
+        let return_to = if login_error.is_some() {
+            "/".to_owned()
+        } else {
+            req.uri()
+                .path_and_query()
+                .map_or_else(|| path.clone(), |pq| pq.as_str().to_owned())
+        };
+        return landing_page(&state, &return_to, login_error.as_deref());
     }
 
     let resp = match state.static_files.dir.clone().oneshot(req).await {

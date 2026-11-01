@@ -1,5 +1,6 @@
-//! `/api/*` handlers (SPEC §5). Every handler takes a [`Principal`], which enforces
-//! authentication, the role check and CSRF.
+//! `/api/*` handlers (SPEC §5). Every handler takes a [`Principal`] (any role) or an [`Admin`],
+//! which enforce authentication, the role check and CSRF. A user-role caller may only read
+//! `/api/me` and `/api/subscription`.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::app::AppState;
-use crate::auth::{self, Principal};
+use crate::auth::{self, Admin, Principal};
 use crate::error::ApiError;
 use crate::settings::{ProtocolSettings, SettingsUpdate};
 use crate::singbox;
@@ -29,11 +30,14 @@ pub struct MeResponse {
     pub email: Option<String>,
     pub roles: Vec<String>,
     pub csrf_token: Option<String>,
+    /// Full access (start/stop/rotate, events, settings). `false`: subscription only.
+    pub is_admin: bool,
 }
 
 pub async fn me(principal: Principal) -> Json<MeResponse> {
     Json(MeResponse {
         csrf_token: principal.csrf_token().map(str::to_string),
+        is_admin: principal.is_admin,
         sub: principal.sub,
         username: principal.username,
         email: principal.email,
@@ -41,7 +45,7 @@ pub async fn me(principal: Principal) -> Json<MeResponse> {
     })
 }
 
-pub async fn status(State(state): State<AppState>, _p: Principal) -> Result<Response, ApiError> {
+pub async fn status(State(state): State<AppState>, _p: Admin) -> Result<Response, ApiError> {
     Ok(Json(state.orchestrator.status_view().await?).into_response())
 }
 
@@ -113,7 +117,7 @@ fn parse_json_body<T: serde::de::DeserializeOwned>(
 // enforced before the body is looked at.
 pub async fn start(
     State(state): State<AppState>,
-    p: Principal,
+    Admin(p): Admin,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
@@ -124,7 +128,7 @@ pub async fn start(
 
 pub async fn stop(
     State(state): State<AppState>,
-    p: Principal,
+    Admin(p): Admin,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
@@ -135,7 +139,7 @@ pub async fn stop(
 
 pub async fn rotate(
     State(state): State<AppState>,
-    p: Principal,
+    Admin(p): Admin,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
@@ -160,7 +164,7 @@ pub struct EventsQuery {
 
 pub async fn events(
     State(state): State<AppState>,
-    _p: Principal,
+    _p: Admin,
     query: Result<Query<EventsQuery>, QueryRejection>,
 ) -> Result<Json<Vec<Event>>, ApiError> {
     let Query(q) =
@@ -202,7 +206,7 @@ pub struct WireGuardResponse {
     pub vps_peer_snippet: Option<String>,
 }
 
-pub async fn wireguard(State(state): State<AppState>, _p: Principal) -> Json<WireGuardResponse> {
+pub async fn wireguard(State(state): State<AppState>, _p: Admin) -> Json<WireGuardResponse> {
     let wg = &state.config.wireguard;
     let peer = wg.peer.as_ref().filter(|_| wg.enabled);
     Json(WireGuardResponse {
@@ -237,9 +241,10 @@ pub struct SettingsResponse {
     pub ports: Ports,
 }
 
-async fn settings_response(state: &AppState) -> SettingsResponse {
-    let cfg = &state.config;
-    let stored = state.orchestrator.store().snapshot().await.protocol;
+fn settings_response(
+    cfg: &crate::config::Config,
+    stored: Option<ProtocolSettings>,
+) -> SettingsResponse {
     let defaults = ProtocolSettings::defaults(cfg);
     SettingsResponse {
         settings: ProtocolSettings::effective(cfg, stored.as_ref()),
@@ -253,8 +258,9 @@ async fn settings_response(state: &AppState) -> SettingsResponse {
     }
 }
 
-pub async fn get_settings(State(state): State<AppState>, _p: Principal) -> Json<SettingsResponse> {
-    Json(settings_response(&state).await)
+pub async fn get_settings(State(state): State<AppState>, _p: Admin) -> Json<SettingsResponse> {
+    let stored = state.orchestrator.store().snapshot().await.protocol;
+    Json(settings_response(&state.config, stored))
 }
 
 /// Human-readable list of what changed, for the event log.
@@ -276,29 +282,30 @@ fn describe_change(old: &ProtocolSettings, new: &ProtocolSettings) -> String {
     if old.shadowsocks != new.shadowsocks {
         parts.push(format!("shadowsocks={}", on_off(new.shadowsocks)));
     }
-    if parts.is_empty() {
-        "settings saved (no change)".into()
-    } else {
-        parts.join(", ")
-    }
+    parts.join(", ")
 }
 
-/// Store `new` (`None` = back to `.env`) and log the change in the same atomic write.
+/// Store `new` (`None` = back to `.env`) and log the change in the same atomic write. When the
+/// effective settings would not change, nothing is written or logged. Returns the stored
+/// override as it is after this call.
 async fn store_settings(
     state: &AppState,
     actor: String,
     new: Option<ProtocolSettings>,
-) -> Result<(), ApiError> {
+) -> Result<Option<ProtocolSettings>, ApiError> {
     let cfg = &state.config;
     state
         .orchestrator
         .store()
-        .update(|s| {
+        .update_if(|s| {
             let old = ProtocolSettings::effective(cfg, s.protocol.as_ref());
             let next = ProtocolSettings::effective(cfg, new.as_ref());
+            if old == next {
+                return (false, s.protocol.clone());
+            }
             let mut detail = describe_change(&old, &next);
             if new.is_none() {
-                detail = format!("reset to .env defaults ({detail})");
+                detail = format!("reset to .env defaults: {detail}");
             }
             s.protocol = new;
             s.push_event(Event {
@@ -308,6 +315,7 @@ async fn store_settings(
                 detail: sanitize_text(&detail, 300),
                 actor,
             });
+            (true, s.protocol.clone())
         })
         .await
         .map_err(ApiError::internal)
@@ -315,7 +323,7 @@ async fn store_settings(
 
 pub async fn put_settings(
     State(state): State<AppState>,
-    p: Principal,
+    Admin(p): Admin,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
@@ -328,16 +336,16 @@ pub async fn put_settings(
     })?;
     let update: SettingsUpdate = parse_json_body(&headers, &body)?;
     let new = update.validate().map_err(ApiError::BadRequest)?;
-    store_settings(&state, p.actor(), Some(new)).await?;
-    Ok(Json(settings_response(&state).await))
+    let stored = store_settings(&state, p.actor(), Some(new)).await?;
+    Ok(Json(settings_response(&state.config, stored)))
 }
 
 pub async fn reset_settings(
     State(state): State<AppState>,
-    p: Principal,
+    Admin(p): Admin,
 ) -> Result<Json<SettingsResponse>, ApiError> {
-    store_settings(&state, p.actor(), None).await?;
-    Ok(Json(settings_response(&state).await))
+    let stored = store_settings(&state, p.actor(), None).await?;
+    Ok(Json(settings_response(&state.config, stored)))
 }
 
 /// Without valid credentials every `/api` path answers 401 — known or not, any method — so

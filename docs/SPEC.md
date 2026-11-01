@@ -158,9 +158,12 @@ triggers outbound traffic.
 
 ### 4.3 Role check
 
-The user is authorized if `OIDC_REQUIRED_ROLE` is in `realm_access.roles` or in
-`resource_access.<OIDC_CLIENT_ID>.roles` of the access token. Authenticated but missing the role
-→ 403.
+Roles are read from `realm_access.roles` and `resource_access.<OIDC_CLIENT_ID>.roles` of the
+access token. `OIDC_REQUIRED_ROLE` (default `vpn-admin`) grants full access; `OIDC_USER_ROLE`
+(default `vpn-user`) grants sign-in plus `GET /api/me` and `GET /api/subscription` only — enough
+to join the VPN, nothing that operates or configures it. A caller with both roles is an admin.
+Authenticated with neither role → 403 (login: `login_error=forbidden`); a user-role caller on an
+admin-only route → 403 `forbidden`.
 
 ### 4.4 CSRF
 
@@ -196,21 +199,21 @@ unauthorized`, so the routes cannot be enumerated anonymously.
 | Method & path | Auth | Response |
 |---|---|---|
 | `GET /healthz` | none | `200 ok` (text/plain); no other info |
-| `GET /api/me` | session or bearer | `{ "sub", "username", "email": string\|null, "roles": [..], "csrf_token": string\|null }` (csrf_token null for bearer); 401 if not logged in |
-| `GET /api/status` | yes | `{ "provider", "region", "instance", "state", "public_ip": string\|null, "cooldown_remaining_s": int, "last_rotation_at": int\|null (unix s) }` |
-| `POST /api/ingress/start` | yes + CSRF | `202 {"ok": true}` |
-| `POST /api/ingress/stop` | yes + CSRF | `202 {"ok": true}` |
-| `POST /api/ingress/rotate` | yes + CSRF | body `{"reason"?: string ≤ 200 chars}` → `200 {"public_ip": "…"}`; `429 {"error":"cooldown","message", "retry_after_s": int}` + `Retry-After`; `409 conflict` if another operation is running |
-| `GET /api/events?limit=N` | yes | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"settings"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
-| `GET /api/subscription` | yes | `{ "url": "<PUBLIC_BASE_URL>/s/<SUB_TOKEN>", "links": [string, …] \| null }` (links null when there is no public IP) |
-| `GET /api/wireguard` | yes | `{ "enabled": bool, "ingress_public_key": string\|null, "ingress_address": string, "vps_peer_snippet": string\|null }` |
-| `GET /api/settings` | yes | `{ "settings": P, "defaults": P, "overridden": bool, "ports": { "vless_tcp", "hy2_udp", "ss" } }` with P = `{ "reality_sni", "hy2_sni", "hysteria2": bool, "hy2_obfs": bool, "shadowsocks": bool }`; `settings` = in effect, `defaults` = from `.env` |
-| `PUT /api/settings` | yes + CSRF | body: a complete P (no unknown fields); SNIs must be public DNS names (≥ 2 labels, alphabetic TLD) → same response as GET; stored in `state.json` and logged as a `settings` event |
-| `DELETE /api/settings` | yes + CSRF | drop the override (back to `.env`) → same response as GET; logged |
+| `GET /api/me` | session or bearer (any role) | `{ "sub", "username", "email": string\|null, "roles": [..], "csrf_token": string\|null, "is_admin": bool }` (csrf_token null for bearer); 401 if not logged in |
+| `GET /api/status` | admin | `{ "provider", "region", "instance", "state", "public_ip": string\|null, "cooldown_remaining_s": int, "last_rotation_at": int\|null (unix s) }` |
+| `POST /api/ingress/start` | admin + CSRF | `202 {"ok": true}` |
+| `POST /api/ingress/stop` | admin + CSRF | `202 {"ok": true}` |
+| `POST /api/ingress/rotate` | admin + CSRF | body `{"reason"?: string ≤ 200 chars}` → `200 {"public_ip": "…"}`; `429 {"error":"cooldown","message", "retry_after_s": int}` + `Retry-After`; `409 conflict` if another operation is running |
+| `GET /api/events?limit=N` | admin | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"settings"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
+| `GET /api/subscription` | any role | `{ "url": "<PUBLIC_BASE_URL>/s/<SUB_TOKEN>", "links": [string, …] \| null }` (links null when there is no public IP) |
+| `GET /api/wireguard` | admin | `{ "enabled": bool, "ingress_public_key": string\|null, "ingress_address": string, "vps_peer_snippet": string\|null }` |
+| `GET /api/settings` | admin | `{ "settings": P, "defaults": P, "overridden": bool, "ports": { "vless_tcp", "hy2_udp", "ss" } }` with P = `{ "reality_sni", "hy2_sni", "hysteria2": bool, "hy2_obfs": bool, "shadowsocks": bool }`; `settings` = in effect, `defaults` = from `.env` |
+| `PUT /api/settings` | admin + CSRF | body: a complete P (no unknown fields); SNIs must be public DNS names (≥ 2 labels, alphabetic TLD) → same response as GET; stored in `state.json` and logged as a `settings` event |
+| `DELETE /api/settings` | admin + CSRF | drop the override (back to `.env`) → same response as GET; logged |
 | `GET /s/{token}` | path token | `200 text/plain` base64 subscription; headers `profile-update-interval: <SUB_UPDATE_HOURS>`, `profile-title: base64:<b64(PROFILE_NAME)>`, `Cache-Control: no-store`; `503` if the ingress has no public IP |
 | `GET /i/{token}/config.json` | path token | `200 application/json` sing-box server config |
 | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout` | see §4 | |
-| any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `302` to `/auth/login` (`?return_to=` unless `/`), any file is a plain 404, and `/?login_error=<code>` gets a minimal neutral HTML page (no redirect, so a failing SSO login cannot loop). The site therefore shows nothing but the IdP login to anyone not signed in. |
+| any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `200` with a minimal neutral HTML page (title "Console", one link to `/auth/login?return_to=<path>`; never a redirect, so crawlers create no pending logins and a failing SSO login cannot loop), any file is a plain 404, and `/?login_error=<code>` is the same page with a short message. The site therefore shows nothing but the IdP login to anyone not signed in. |
 
 Only one start/stop/rotate runs at a time (a mutex; if busy → 409). Rotation: refuse while in
 cooldown. Remember the old IP as "burned". If AWS returns an IP that is burned or equal to the

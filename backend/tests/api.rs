@@ -200,7 +200,7 @@ fn assert_security_headers(resp: &Response, what: &str) {
 async fn security_headers_on_every_kind_of_response() {
     let app = app();
     let cases = [
-        ("/", StatusCode::FOUND),
+        ("/", StatusCode::OK),
         ("/?login_error=denied", StatusCode::OK),
         ("/healthz", StatusCode::OK),
         ("/assets/app-abc123.js", StatusCode::NOT_FOUND),
@@ -268,6 +268,75 @@ async fn api_requires_auth_and_is_not_cached() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn user_role_sees_only_the_subscription() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-user"]);
+    let me = body_json(app.get_with_session("/api/me", &cookie).await).await;
+    assert_eq!(me["is_admin"], false);
+    let (admin, _) = app.login(&["vpn-admin", "vpn-user"]);
+    let me = body_json(app.get_with_session("/api/me", &admin).await).await;
+    assert_eq!(me["is_admin"], true);
+
+    // the SPA and the subscription are served
+    let resp = app.get_with_session("/", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app.get_with_session("/api/subscription", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        body_json(resp).await["url"]
+            .as_str()
+            .unwrap()
+            .contains("/s/")
+    );
+
+    // everything else is forbidden, reads and writes alike
+    for uri in [
+        "/api/status",
+        "/api/events",
+        "/api/wireguard",
+        "/api/settings",
+    ] {
+        let resp = app.get_with_session(uri, &cookie).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(body_json(resp).await["error"], "forbidden", "{uri}");
+    }
+    for uri in [
+        "/api/ingress/start",
+        "/api/ingress/stop",
+        "/api/ingress/rotate",
+    ] {
+        let resp = app
+            .send(
+                request(Method::POST, uri)
+                    .header(header::COOKIE, session_cookie(&cookie))
+                    .header("x-csrf-token", &csrf)
+                    .header(header::ORIGIN, BASE)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    let resp = app
+        .put_settings(
+            &cookie,
+            &csrf,
+            &settings_body("a.example.com", true, false, true),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        app.state
+            .orchestrator
+            .store()
+            .snapshot()
+            .await
+            .events
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -752,19 +821,25 @@ async fn anonymous_api_probing_reveals_nothing() {
 #[tokio::test]
 async fn anonymous_visitors_get_no_app_code() {
     let app = app();
-    // Pages redirect to the IdP login (via /auth/login), keeping the target.
+    // Pages: a bare neutral page with a sign-in link that keeps the target. No redirect, so a
+    // crawler following links does not create pending logins by itself.
     let resp = app.get("/").await;
-    assert_eq!(resp.status(), StatusCode::FOUND);
-    assert_eq!(
-        resp.headers()[header::LOCATION],
-        format!("{BASE}/auth/login").as_str()
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
-    let resp = app.get("/events?x=1").await;
-    assert_eq!(
-        resp.headers()[header::LOCATION],
-        format!("{BASE}/auth/login?return_to=%2Fevents%3Fx%3D1").as_str()
+    let body = body_string(resp).await;
+    assert!(
+        body.contains(&format!("href=\"{BASE}/auth/login\"")),
+        "{body}"
     );
+    // Nothing of the app, and no telling words (BASE itself happens to contain "vpn").
+    let text = body.replace(BASE, "").to_lowercase();
+    assert!(!text.contains("spa") && !text.contains("vpn"), "{body}");
+    assert_eq!(app.state.sessions.pending_len(), 0);
+    let resp = app.get("/events?x=1").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains(&format!(
+        "href=\"{BASE}/auth/login?return_to=%2Fevents%3Fx%3D1\""
+    )));
     // Files: plain 404, never the SPA.
     for uri in ["/assets/app-abc123.js", "/index.html", "/favicon.svg"] {
         let resp = app.get(uri).await;
@@ -774,12 +849,12 @@ async fn anonymous_visitors_get_no_app_code() {
     // An unknown or expired session is anonymous.
     let resp = app.get_with_session("/assets/app-abc123.js", "bogus").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    // A failed login gets a neutral page instead of another redirect (no loop).
+    // A failed login adds a message; "try again" starts from the home page.
     let resp = app.get("/?login_error=forbidden").await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("This account has no access."));
-    assert!(body.contains("href=\"/auth/login\""));
+    assert!(body.contains(&format!("href=\"{BASE}/auth/login\"")));
     assert!(!body.contains("spa"));
 }
 
@@ -1058,6 +1133,18 @@ async fn settings_change_the_ingress_config_and_subscription() {
             .contains("hy2_obfs=on")
     );
 
+    // saving the same settings again changes nothing and logs nothing
+    let before = app.state.orchestrator.store().snapshot().await;
+    let resp = app
+        .put_settings(
+            &cookie,
+            &csrf,
+            &settings_body("www.example.com", true, true, false),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(app.state.orchestrator.store().snapshot().await, before);
+
     // reset to .env
     let resp = app
         .send(
@@ -1078,6 +1165,28 @@ async fn settings_change_the_ingress_config_and_subscription() {
             .len(),
         3
     );
+    let events = body_json(app.get_with_session("/api/events", &cookie).await).await;
+    assert!(
+        events[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("reset to .env defaults: ")
+    );
+
+    // a reset without an override is a no-op
+    let before = app.state.orchestrator.store().snapshot().await;
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/settings")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(app.state.orchestrator.store().snapshot().await, before);
 }
 
 #[tokio::test]

@@ -130,6 +130,24 @@ impl StateStore {
         Ok(result)
     }
 
+    /// Like [`update`](Self::update), but the closure says whether anything changed; when it
+    /// returns `false` nothing is persisted (the in-memory state must then be unchanged too).
+    pub async fn update_if<R>(
+        &self,
+        f: impl FnOnce(&mut PersistedState) -> (bool, R),
+    ) -> anyhow::Result<R> {
+        let mut guard = self.data.lock().await;
+        let (changed, result) = f(&mut guard);
+        if !changed {
+            return Ok(result);
+        }
+        guard.enforce_caps();
+        let dir = self.dir.clone();
+        let to_write = guard.clone();
+        tokio::task::spawn_blocking(move || write_atomic(&dir, &to_write)).await??;
+        Ok(result)
+    }
+
     /// Append an event (convenience wrapper around [`update`](Self::update)).
     pub async fn record(
         &self,

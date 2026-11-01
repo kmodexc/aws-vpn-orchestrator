@@ -193,7 +193,7 @@ pub async fn callback(
     };
 
     let cfg = &state.config;
-    if !access.has_role(&cfg.oidc.required_role, &cfg.oidc.client_id) {
+    if crate::auth::access_of_claims(cfg, &access).is_none() {
         tracing::info!(sub = %id.sub, "login denied: missing required role");
         return fail("forbidden", false);
     }

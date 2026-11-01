@@ -9,6 +9,7 @@ const ME = {
   username: "alice",
   email: null,
   roles: ["vpn-admin"],
+  is_admin: true,
   csrf_token: "fresh-token",
 };
 

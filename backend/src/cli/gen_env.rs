@@ -104,6 +104,8 @@ pub fn render() -> anyhow::Result<String> {
     line("OIDC_CLIENT_ID=console");
     line("OIDC_CLIENT_SECRET=");
     line("OIDC_REQUIRED_ROLE=vpn-admin");
+    line("# Role that may only sign in and read the subscription (no controls)");
+    line("OIDC_USER_ROLE=vpn-user");
     line(
         "# Comma list of client ids whose Bearer tokens are accepted (azp); default OIDC_CLIENT_ID",
     );

@@ -3,7 +3,6 @@ import {
   ApiClient,
   ApiError,
   describeError,
-  loginErrorMessage,
   loginUrl,
   parseRetryAfter,
   safeNavigationUrl,
@@ -27,6 +26,7 @@ const ME = {
   email: null,
   roles: ["vpn-admin"],
   csrf_token: "csrf-123",
+  is_admin: true,
 };
 
 const STATUS = {
@@ -329,9 +329,4 @@ describe("helpers", () => {
     expect(loginUrl("//evil.example", "")).toBe("/auth/login?return_to=%2F");
   });
 
-  it("loginErrorMessage maps known codes and hides unknown text", () => {
-    expect(loginErrorMessage(null)).toBeNull();
-    expect(loginErrorMessage("forbidden")).toMatch(/role/);
-    expect(loginErrorMessage("<b>hi</b>")).toBe("Sign-in failed. Please try again.");
-  });
 });

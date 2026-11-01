@@ -1,14 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import {
-  ApiClient,
-  ApiError,
-  describeError,
-  loginErrorMessage,
-  loginUrl,
-  type Me,
-} from "./api";
+import { ApiClient, ApiError, describeError, loginUrl, type Me } from "./api";
 import { LOGOUT_FAILED_FORBIDDEN_MESSAGE, LOGOUT_FAILED_MESSAGE, performLogout } from "./logout";
 import { Dashboard } from "./components/Dashboard";
+import { UserHome } from "./components/UserHome";
 import { ErrorScreen, ForbiddenScreen, LoadingScreen, LoginScreen } from "./components/Screens";
 
 type View =
@@ -19,20 +13,6 @@ type View =
   | { kind: "dashboard"; me: Me };
 
 const api = new ApiClient();
-
-/** Read and remove `login_error` from the address bar (so a reload does not show it again). */
-function takeLoginError(): string | null {
-  const url = new URL(window.location.href);
-  const code = url.searchParams.get("login_error");
-  if (code !== null) {
-    url.searchParams.delete("login_error");
-    const qs = url.searchParams.toString();
-    window.history.replaceState(null, "", url.pathname + (qs === "" ? "" : `?${qs}`) + url.hash);
-  }
-  return code;
-}
-
-const initialLoginError = loginErrorMessage(takeLoginError());
 
 export function App() {
   const [view, setView] = useState<View>({ kind: "loading" });
@@ -64,7 +44,9 @@ export function App() {
       (e: unknown) => {
         if (cancelled) return;
         if (e instanceof ApiError && e.code === "unauthorized") {
-          setView({ kind: "login", message: initialLoginError });
+          // A failed sign-in never reaches the SPA: the backend answers `/?login_error=…`
+          // for anonymous visitors with its own page.
+          setView({ kind: "login", message: null });
         } else if (e instanceof ApiError && e.code === "forbidden") {
           setView({ kind: "forbidden" });
         } else {
@@ -136,6 +118,17 @@ export function App() {
         />
       );
     case "dashboard":
+      if (!view.me.is_admin) {
+        return (
+          <UserHome
+            api={api}
+            me={view.me}
+            onLogout={() => void logout(false)}
+            loggingOut={loggingOut}
+            logoutError={logoutError}
+          />
+        );
+      }
       return (
         <Dashboard
           api={api}

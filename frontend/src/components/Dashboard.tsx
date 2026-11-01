@@ -43,6 +43,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
   const [events, setEvents] = useState<EventEntry[] | null>(null);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [wg, setWg] = useState<WireGuard | null>(null);
+  const [settingsVersion, setSettingsVersion] = useState(0);
 
   const [busy, setBusy] = useState<Action | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -202,8 +203,18 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
           onAction={(a, r) => void runAction(a, r)}
           onRefresh={manualRefresh}
         />
-        <SubscriptionCard api={api} ipKey={status?.public_ip ?? null} />
-        <SettingsCard api={api} onSaved={manualRefresh} />
+        <SubscriptionCard
+          api={api}
+          ipKey={status?.public_ip ?? null}
+          settingsVersion={settingsVersion}
+        />
+        <SettingsCard
+          api={api}
+          onSaved={() => {
+            setSettingsVersion((n) => n + 1);
+            manualRefresh();
+          }}
+        />
         {wg?.enabled === true && <WireGuardCard wg={wg} />}
         <EventLog events={events} error={eventsError} now={slowNow} />
       </main>

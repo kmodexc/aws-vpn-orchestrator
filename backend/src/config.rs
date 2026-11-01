@@ -61,7 +61,10 @@ pub struct OidcConfig {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: Secret<String>,
+    /// Role for full access (admin).
     pub required_role: String,
+    /// Role that may only sign in and read the subscription.
+    pub user_role: String,
     pub allowed_clients: Vec<String>,
     pub scopes: String,
 }
@@ -369,6 +372,13 @@ fn parse_oidc<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<OidcConfig,
         ));
     }
     let required_role = env.or("OIDC_REQUIRED_ROLE", "vpn-admin");
+    let user_role = env.or("OIDC_USER_ROLE", "vpn-user");
+    if user_role.len() > 255 || user_role.chars().any(char::is_control) {
+        return Err(err("OIDC_USER_ROLE", "must be a short name"));
+    }
+    if user_role == required_role {
+        return Err(err("OIDC_USER_ROLE", "must differ from OIDC_REQUIRED_ROLE"));
+    }
     if required_role.len() > 255 || required_role.chars().any(char::is_control) {
         return Err(err(
             "OIDC_REQUIRED_ROLE",
@@ -411,6 +421,7 @@ fn parse_oidc<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<OidcConfig,
         client_id,
         client_secret: Secret::new(client_secret),
         required_role,
+        user_role,
         allowed_clients,
         scopes: scope_list.join(" "),
     })
@@ -849,6 +860,7 @@ pub(crate) mod tests {
         assert_eq!(c.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(c.oidc.allowed_clients, vec!["vpn-control".to_string()]);
         assert_eq!(c.oidc.required_role, "vpn-admin");
+        assert_eq!(c.oidc.user_role, "vpn-user");
         assert_eq!(c.proxy.ss_port, 8443);
         assert_eq!(c.profile_name, "travel");
         assert!(!c.wireguard.enabled);

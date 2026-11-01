@@ -25,9 +25,9 @@ pub enum AuthMethod {
     Bearer,
 }
 
-/// An authenticated and authorized caller (has `OIDC_REQUIRED_ROLE`). Using this extractor in
-/// a handler enforces authentication, the role check and, for cookie sessions on state-changing
-/// methods, CSRF protection.
+/// An authenticated and authorized caller: has `OIDC_REQUIRED_ROLE` (admin) or `OIDC_USER_ROLE`
+/// (may only read the subscription). Using this extractor in a handler enforces authentication,
+/// the role check and, for cookie sessions on state-changing methods, CSRF protection.
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub sub: String,
@@ -35,6 +35,36 @@ pub struct Principal {
     pub email: Option<String>,
     pub roles: Vec<String>,
     pub method: AuthMethod,
+    /// Has `OIDC_REQUIRED_ROLE`.
+    pub is_admin: bool,
+}
+
+/// A [`Principal`] with the admin role. Everything that changes state or reveals more than the
+/// subscription requires it; a user-role caller gets 403.
+#[derive(Debug, Clone)]
+pub struct Admin(pub Principal);
+
+/// Which access a set of roles grants: `Some(true)` admin, `Some(false)` user, `None` nothing.
+fn access_of<'a>(
+    cfg: &crate::config::Config,
+    roles: impl Iterator<Item = &'a str>,
+) -> Option<bool> {
+    let mut user = false;
+    for r in roles {
+        if r == cfg.oidc.required_role {
+            return Some(true);
+        }
+        if r == cfg.oidc.user_role {
+            user = true;
+        }
+    }
+    user.then_some(false)
+}
+
+/// Access granted by a token's roles (see [`access_of`]).
+pub fn access_of_claims(cfg: &crate::config::Config, claims: &jwt::AccessClaims) -> Option<bool> {
+    let roles = claims.roles(&cfg.oidc.client_id);
+    access_of(cfg, roles.iter().map(String::as_str))
 }
 
 impl Principal {
@@ -91,9 +121,9 @@ pub async fn authenticate(
             state.limiter.record_failure(client_ip);
             return Err(ApiError::Unauthorized);
         };
-        if !claims.has_role(&cfg.oidc.required_role, &cfg.oidc.client_id) {
+        let Some(is_admin) = access_of_claims(cfg, &claims) else {
             return Err(ApiError::Forbidden);
-        }
+        };
         return Ok(Principal {
             username: claims
                 .preferred_username
@@ -103,20 +133,16 @@ pub async fn authenticate(
             roles: claims.roles(&cfg.oidc.client_id),
             sub,
             method: AuthMethod::Bearer,
+            is_admin,
         });
     }
 
     let cookie =
         cookies::get_cookie(headers, cookies::SESSION_COOKIE).ok_or(ApiError::Unauthorized)?;
     let session = state.sessions.get(&cookie).ok_or(ApiError::Unauthorized)?;
-    if !session
-        .data
-        .roles
-        .iter()
-        .any(|r| *r == cfg.oidc.required_role)
-    {
+    let Some(is_admin) = access_of(cfg, session.data.roles.iter().map(String::as_str)) else {
         return Err(ApiError::Forbidden);
-    }
+    };
     if !csrf::is_safe_method(method) {
         csrf::verify(headers, session.csrf_token.expose(), &cfg.public_base_url)?;
     }
@@ -128,7 +154,23 @@ pub async fn authenticate(
         method: AuthMethod::Session {
             csrf_token: session.csrf_token.expose().clone(),
         },
+        is_admin,
     })
+}
+
+impl FromRequestParts<AppState> for Admin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let p = Principal::from_request_parts(parts, state).await?;
+        if !p.is_admin {
+            return Err(ApiError::Forbidden);
+        }
+        Ok(Admin(p))
+    }
 }
 
 impl FromRequestParts<AppState> for Principal {

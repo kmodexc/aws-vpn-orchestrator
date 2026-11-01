@@ -141,6 +141,11 @@ impl SessionStore {
         Ok(cookie)
     }
 
+    /// Number of pending (not yet completed) logins. For tests and metrics.
+    pub fn pending_len(&self) -> usize {
+        lock(&self.maps).pending.len()
+    }
+
     /// Look up a session and refresh its idle timer. Expired sessions are removed.
     pub fn get(&self, cookie: &str) -> Option<SessionView> {
         self.get_at(cookie, Instant::now())

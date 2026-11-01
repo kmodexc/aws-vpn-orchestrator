@@ -27,6 +27,8 @@ export interface Me {
   email: string | null;
   roles: string[];
   csrf_token: string | null;
+  /** Full access. `false`: the account may only read the subscription. */
+  is_admin: boolean;
 }
 
 export interface Status {
@@ -256,7 +258,8 @@ export function parseMe(v: unknown): Me {
     isString(v.username) &&
     isStringOrNull(v.email) &&
     isStringArray(v.roles) &&
-    isStringOrNull(v.csrf_token)
+    isStringOrNull(v.csrf_token) &&
+    typeof v.is_admin === "boolean"
   ) {
     return {
       sub: v.sub,
@@ -264,6 +267,7 @@ export function parseMe(v: unknown): Me {
       email: v.email,
       roles: v.roles,
       csrf_token: v.csrf_token,
+      is_admin: v.is_admin,
     };
   }
   return bad();
@@ -618,19 +622,3 @@ export function loginUrl(pathname: string, search: string): string {
 }
 
 /** Friendly text for the `login_error` query parameter set by /auth/callback (SPEC §4.1). */
-export function loginErrorMessage(code: string | null): string | null {
-  switch (code) {
-    case null:
-      return null;
-    case "denied":
-      return "Sign-in was cancelled or denied.";
-    case "invalid":
-      return "Sign-in failed or expired. Please try again.";
-    case "forbidden":
-      return "Your account lacks the required role for this app.";
-    case "unavailable":
-      return "The login service is unavailable right now. Try again shortly.";
-    default:
-      return "Sign-in failed. Please try again.";
-  }
-}
