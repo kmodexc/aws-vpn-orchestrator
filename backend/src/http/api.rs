@@ -14,9 +14,10 @@ use serde_json::json;
 use crate::app::AppState;
 use crate::auth::{self, Admin, Principal};
 use crate::error::ApiError;
-use crate::settings::{ProtocolSettings, SettingsUpdate};
+use crate::settings::{DebugLog, DebugLogRequest, ProtocolSettings, SettingsUpdate, log_level};
 use crate::singbox;
 use crate::state::{Event, EventAction};
+use crate::telemetry::{LogLine, MAX_LOG_LINES, Snapshot};
 use crate::util::{sanitize_text, unix_now};
 
 pub const MAX_EVENTS_LIMIT: usize = 200;
@@ -349,6 +350,138 @@ pub async fn reset_settings(
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let stored = store_settings(&state, p.actor(), None).await?;
     Ok(Json(settings_response(&state.config, stored)))
+}
+
+#[derive(Debug, Serialize)]
+pub struct TelemetryResponse {
+    pub report: Snapshot,
+    /// The temporary log level, if one is set (it may already have expired: see `log_level`).
+    pub debug_log: Option<DebugLog>,
+    /// Level the served config carries right now.
+    pub log_level: String,
+    pub now: i64,
+}
+
+async fn telemetry_response(state: &AppState) -> TelemetryResponse {
+    let now = unix_now();
+    let debug_log = state.orchestrator.store().snapshot().await.debug_log;
+    TelemetryResponse {
+        report: state.telemetry.snapshot(),
+        log_level: log_level(debug_log.as_ref(), now).to_string(),
+        debug_log,
+        now,
+    }
+}
+
+pub async fn telemetry(State(state): State<AppState>, _p: Admin) -> Json<TelemetryResponse> {
+    Json(telemetry_response(&state).await)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    pub after: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LogsResponse {
+    pub lines: Vec<LogLine>,
+    /// Pass as `after` next time to get only newer lines.
+    pub next: u64,
+    pub dropped: u64,
+}
+
+pub async fn logs(
+    State(state): State<AppState>,
+    _p: Admin,
+    query: Result<Query<LogsQuery>, QueryRejection>,
+) -> Result<Json<LogsResponse>, ApiError> {
+    let Query(q) =
+        query.map_err(|_| ApiError::BadRequest("after and limit must be non-negative integers"))?;
+    let after = q.after.unwrap_or(0);
+    let limit = q.limit.unwrap_or(MAX_LOG_LINES).clamp(1, MAX_LOG_LINES);
+    let lines = state.telemetry.logs_after(after, limit);
+    let next = lines
+        .last()
+        .map_or_else(|| after.max(state.telemetry.next_seq()), |l| l.seq + 1);
+    Ok(Json(LogsResponse {
+        lines,
+        next,
+        dropped: state.telemetry.snapshot().log_dropped,
+    }))
+}
+
+pub async fn clear_logs(State(state): State<AppState>, _p: Admin) -> Json<LogsResponse> {
+    state.telemetry.clear_logs();
+    Json(LogsResponse {
+        lines: Vec::new(),
+        next: state.telemetry.next_seq(),
+        dropped: 0,
+    })
+}
+
+async fn store_debug_log(
+    state: &AppState,
+    actor: String,
+    new: Option<DebugLog>,
+    detail: String,
+) -> Result<(), ApiError> {
+    state
+        .orchestrator
+        .store()
+        .update_if(|s| {
+            if s.debug_log == new {
+                return (false, ());
+            }
+            s.debug_log = new;
+            s.push_event(Event {
+                at: unix_now(),
+                action: EventAction::Settings,
+                ip: None,
+                detail,
+                actor,
+            });
+            (true, ())
+        })
+        .await
+        .map_err(ApiError::internal)
+}
+
+/// Raise the sing-box log level for a while. The ingress picks it up within about a minute
+/// (its report reply says the config is stale) and the level reverts by itself.
+pub async fn put_debug_log(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<TelemetryResponse>, ApiError> {
+    let body = body.map_err(|r| {
+        if r.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge
+        } else {
+            ApiError::BadRequest("cannot read request body")
+        }
+    })?;
+    let req: DebugLogRequest = parse_json_body(&headers, &body)?;
+    let minutes = req.minutes;
+    let debug = req.validate(unix_now()).map_err(ApiError::BadRequest)?;
+    let detail = format!("sing-box log level {} for {minutes} min", debug.level);
+    store_debug_log(&state, p.actor(), Some(debug), detail).await?;
+    Ok(Json(telemetry_response(&state).await))
+}
+
+pub async fn clear_debug_log(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+) -> Result<Json<TelemetryResponse>, ApiError> {
+    store_debug_log(
+        &state,
+        p.actor(),
+        None,
+        "sing-box log level back to warn".into(),
+    )
+    .await?;
+    Ok(Json(telemetry_response(&state).await))
 }
 
 /// Without valid credentials every `/api` path answers 401 — known or not, any method — so

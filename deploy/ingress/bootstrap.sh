@@ -23,6 +23,8 @@
 #   3. pulls the server config from ${CONTROL_PLANE_URL}/i/${INGRESS_TOKEN}/config.json
 #      (https only, TLS >= 1.2), validates it with `sing-box check`, installs it 0600 and restarts
 #      sing-box only when it changed — on boot and every 10 minutes (systemd timer)
+#   3b. reports counters (connections, traffic) and new journal lines to the control plane
+#      once a minute and re-pulls the config at once when the reply says it is stale
 #   4. blocks the sing-box user from reaching the instance metadata service (169.254.169.254),
 #      so a proxy client can never read user-data (which contains INGRESS_TOKEN) or credentials
 #   5. host firewall (ufw): deny all inbound except SSH and the proxy ports
@@ -71,6 +73,7 @@ readonly SB_ETC="/etc/sing-box"
 readonly SB_CONFIG="${SB_ETC}/config.json"
 readonly FETCH_ENV="/etc/sing-box-fetch.env"
 readonly FETCH_BIN="/usr/local/sbin/sing-box-fetch-config"
+readonly REPORT_BIN="/usr/local/sbin/sing-box-report"
 readonly NFT_FILE="/etc/sing-box-egress.nft"
 
 log() { printf '[bootstrap] %s\n' "$*" >&2; }
@@ -117,7 +120,7 @@ export DEBIAN_FRONTEND=noninteractive
 log "installing packages"
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
-  ca-certificates curl tar coreutils diffutils ufw nftables unattended-upgrades
+  ca-certificates curl tar coreutils diffutils ufw nftables unattended-upgrades python3
 
 # ---------------------------------------------------------------------------------------------
 # 2. sing-box binary (pinned + checksum verified)
@@ -236,6 +239,147 @@ chmod 0700 "${FETCH_BIN}.new"
 mv -f "${FETCH_BIN}.new" "${FETCH_BIN}"
 
 # ---------------------------------------------------------------------------------------------
+# 4b. Reporter: counters + new journal lines to the control plane, once a minute (root, oneshot)
+# ---------------------------------------------------------------------------------------------
+log "installing ${REPORT_BIN}"
+cat >"${REPORT_BIN}.new" <<'REPORT'
+#!/usr/bin/env bash
+# Report sing-box counters and the journal lines since the previous run to the control plane
+# (POST /i/<token>/report). The reply says whether our config is stale; then the fetcher runs
+# right away instead of waiting for its 10-minute timer. Exit 0 on network trouble (the next
+# run retries; the journal cursor only advances after a successful report, so no line is lost).
+set -euo pipefail
+umask 077
+readonly SB_BIN=/usr/local/bin/sing-box
+readonly SB_CONFIG=/etc/sing-box/config.json
+readonly FETCH_ENV=/etc/sing-box-fetch.env
+readonly STATE_DIR=/var/lib/sing-box-report
+readonly CURSOR="${STATE_DIR}/journal.cursor"
+# Keep well under the control plane's 16 KiB body limit.
+readonly MAX_LINES=300
+readonly MAX_LOG_BYTES=12000
+
+log() { printf 'sing-box-report: %s\n' "$*" >&2; }
+
+CONTROL_PLANE_URL="$(sed -n 's/^CONTROL_PLANE_URL=//p' "${FETCH_ENV}" | head -n1)"
+INGRESS_TOKEN="$(sed -n 's/^INGRESS_TOKEN=//p' "${FETCH_ENV}" | head -n1)"
+[[ ${CONTROL_PLANE_URL} =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || { log "bad CONTROL_PLANE_URL"; exit 1; }
+[[ ${INGRESS_TOKEN} =~ ^[A-Za-z0-9_-]{32,}$ ]] || { log "bad INGRESS_TOKEN"; exit 1; }
+
+install -d -m 0700 "${STATE_DIR}"
+work="$(mktemp -d)"
+trap 'rm -rf -- "${work}"' EXIT
+
+# --- journal lines since the last successful report (first run: the last 200 lines) ---------
+jargs=(-n 200)
+if [[ -s ${CURSOR} ]]; then
+  jargs=(--after-cursor "$(<"${CURSOR}")")
+fi
+if ! journalctl -u sing-box -o cat --no-pager --show-cursor "${jargs[@]}" >"${work}/log" 2>/dev/null; then
+  # e.g. the journal was rotated away under the cursor: start over with a tail
+  rm -f -- "${CURSOR}"
+  journalctl -u sing-box -o cat --no-pager --show-cursor -n 200 >"${work}/log" 2>/dev/null || :>"${work}/log"
+fi
+new_cursor="$(sed -n 's/^-- cursor: //p' "${work}/log" | tail -n1)"
+
+# --- counters from sing-box's loopback stats API (secret is in the served config) ------------
+secret=""
+if [[ -s ${SB_CONFIG} ]]; then
+  secret="$(python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get("experimental",{}).get("clash_api",{}).get("secret",""))
+except Exception:
+    pass' "${SB_CONFIG}" 2>/dev/null || true)"
+fi
+:>"${work}/stats"
+if [[ -n ${secret} ]]; then
+  # Header via stdin config, not argv (the secret must not show up in `ps`).
+  printf 'url = "http://127.0.0.1:9090/connections"\nheader = "Authorization: Bearer %s"\n' "${secret}" \
+    | curl --config - --fail --silent --max-time 5 --max-filesize 4194304 \
+        --output "${work}/stats" 2>/dev/null || :>"${work}/stats"
+fi
+
+version="$("${SB_BIN}" version 2>/dev/null | awk 'NR==1 {print $3}' || true)"
+active="$(systemctl is-active sing-box.service 2>/dev/null || true)"
+started_us="$(systemctl show sing-box.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)"
+now_s="$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+uptime_s=""
+if [[ ${active} == active && ${started_us} =~ ^[0-9]+$ && ${started_us} -gt 0 ]]; then
+  uptime_s=$(( now_s - started_us / 1000000 ))
+  ((uptime_s >= 0)) || uptime_s=0
+fi
+config_sha256="$(sha256sum "${SB_CONFIG}" 2>/dev/null | cut -d' ' -f1 || true)"
+[[ ${config_sha256} =~ ^[0-9a-f]{64}$ ]] || config_sha256="$(printf '%064d' 0)"
+
+# --- body: JSON built by python (quoting, size cap) ------------------------------------------
+python3 - "${work}/log" "${work}/stats" "${work}/body" "${version}" "${uptime_s}" "${config_sha256}" \
+  "${MAX_LINES}" "${MAX_LOG_BYTES}" <<'PY'
+import json, sys
+log_path, stats_path, out_path, version, uptime_s, config_sha256, max_lines, max_bytes = sys.argv[1:9]
+max_lines, max_bytes = int(max_lines), int(max_bytes)
+lines = []
+with open(log_path, encoding="utf-8", errors="replace") as f:
+    for raw in f:
+        line = raw.rstrip("\n")
+        if line.startswith("-- "):      # "-- cursor: …", "-- No entries --"
+            continue
+        lines.append(line[:1000])
+dropped = 0
+if len(lines) > max_lines:
+    dropped = len(lines) - max_lines
+    lines = lines[-max_lines:]
+while lines and len(json.dumps(lines)) > max_bytes:
+    lines.pop(0)
+    dropped += 1
+connections = upload = download = None
+try:
+    with open(stats_path, encoding="utf-8") as f:
+        st = json.load(f)
+    connections = len(st.get("connections") or [])
+    upload = int(st.get("uploadTotal") or 0)
+    download = int(st.get("downloadTotal") or 0)
+except Exception:
+    pass
+body = {
+    "version": version or "unknown",
+    "uptime_s": int(uptime_s) if uptime_s.isdigit() else None,
+    "connections": connections,
+    "upload_total": upload,
+    "download_total": download,
+    "config_sha256": config_sha256,
+    "log": lines,
+    "log_dropped": dropped,
+}
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(body, f, separators=(",", ":"))
+PY
+
+# --- send (token via stdin config, never argv; no redirects) --------------------------------
+rc=0
+printf 'url = "%s/i/%s/report"\nheader = "Content-Type: application/json"\n' "${CONTROL_PLANE_URL}" "${INGRESS_TOKEN}" \
+  | curl --config - --fail --silent \
+      --proto '=https' --tlsv1.2 --max-redirs 0 \
+      --connect-timeout 10 --max-time 30 \
+      --data-binary "@${work}/body" --max-filesize 65536 \
+      --output "${work}/reply" 2>/dev/null || rc=$?
+if ((rc != 0)); then
+  log "report failed (curl exit code ${rc}); will retry"
+  exit 0
+fi
+# Only now is the journal consumed.
+if [[ -n ${new_cursor} ]]; then
+  printf '%s\n' "${new_cursor}" >"${CURSOR}.new" && mv -f "${CURSOR}.new" "${CURSOR}"
+fi
+if grep -q '"config_stale":true' "${work}/reply" 2>/dev/null; then
+  log "config is stale — fetching now"
+  systemctl --no-block start sing-box-config.service
+fi
+REPORT
+chown root:root "${REPORT_BIN}.new"
+chmod 0700 "${REPORT_BIN}.new"
+mv -f "${REPORT_BIN}.new" "${REPORT_BIN}"
+
+# ---------------------------------------------------------------------------------------------
 # 5. Egress guard: sing-box must not reach the instance metadata service
 # ---------------------------------------------------------------------------------------------
 log "installing egress guard (${NFT_FILE})"
@@ -313,6 +457,45 @@ Persistent=false
 WantedBy=timers.target
 UNIT
 
+
+cat >/etc/systemd/system/sing-box-report.service <<UNIT
+[Unit]
+Description=Report sing-box counters and journal lines to the vpn-control plane
+Wants=network-online.target
+After=network-online.target sing-box.service
+
+[Service]
+Type=oneshot
+ExecStart=${REPORT_BIN}
+StateDirectory=sing-box-report
+StateDirectoryMode=0700
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sing-box-report
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UNIT
+
+cat >/etc/systemd/system/sing-box-report.timer <<'UNIT'
+[Unit]
+Description=Report to the vpn-control plane once a minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 cat >/etc/systemd/system/sing-box.service <<UNIT
 [Unit]
 Description=sing-box proxy server (vpn-control ingress)
@@ -380,6 +563,7 @@ else
   log "WARNING: no config yet — sing-box starts automatically after the first successful fetch"
 fi
 systemctl start sing-box-config.timer
+systemctl enable --now sing-box-report.timer
 
 # ---------------------------------------------------------------------------------------------
 # 7. Host firewall (ufw). SSH is allowed BEFORE enabling, so an SSH session is not cut off.

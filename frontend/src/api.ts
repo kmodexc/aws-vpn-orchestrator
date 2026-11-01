@@ -87,6 +87,41 @@ export interface SettingsResponse {
   ports: { vless_tcp: number; hy2_udp: number; ss: number };
 }
 
+export type DebugLogLevel = "info" | "debug" | "trace";
+
+/** What the ingress last reported (`/api/ingress/telemetry`). */
+export interface Telemetry {
+  report: {
+    last_report_at: number | null;
+    version: string | null;
+    uptime_s: number | null;
+    connections: number | null;
+    upload_total: number | null;
+    download_total: number | null;
+    upload_24h: number;
+    download_24h: number;
+    config_sha256: string | null;
+    log_lines: number;
+    log_dropped: number;
+  };
+  debug_log: { level: string; until: number } | null;
+  /** Level in the config served right now. */
+  log_level: string;
+  /** Server time (unix s) when this was produced. */
+  now: number;
+}
+
+export interface LogLine {
+  seq: number;
+  text: string;
+}
+
+export interface LogChunk {
+  lines: LogLine[];
+  next: number;
+  dropped: number;
+}
+
 export interface LogoutResponse {
   logout_url: string;
 }
@@ -400,6 +435,75 @@ export function parseSettings(v: unknown): SettingsResponse {
   return bad();
 }
 
+function parseReport(v: unknown): Telemetry["report"] {
+  if (
+    isObject(v) &&
+    isIntOrNull(v.last_report_at) &&
+    isStringOrNull(v.version) &&
+    isIntOrNull(v.uptime_s) &&
+    isIntOrNull(v.connections) &&
+    isIntOrNull(v.upload_total) &&
+    isIntOrNull(v.download_total) &&
+    isInt(v.upload_24h) &&
+    isInt(v.download_24h) &&
+    isStringOrNull(v.config_sha256) &&
+    isInt(v.log_lines) &&
+    isInt(v.log_dropped)
+  ) {
+    return {
+      last_report_at: v.last_report_at,
+      version: v.version,
+      uptime_s: v.uptime_s,
+      connections: v.connections,
+      upload_total: v.upload_total,
+      download_total: v.download_total,
+      upload_24h: v.upload_24h,
+      download_24h: v.download_24h,
+      config_sha256: v.config_sha256,
+      log_lines: v.log_lines,
+      log_dropped: v.log_dropped,
+    };
+  }
+  return bad();
+}
+
+function parseDebugLog(v: unknown): Telemetry["debug_log"] {
+  if (v === null) return null;
+  if (isObject(v) && isString(v.level) && isInt(v.until)) {
+    return { level: v.level, until: v.until };
+  }
+  return bad();
+}
+
+export function parseTelemetry(v: unknown): Telemetry {
+  if (isObject(v) && isString(v.log_level) && isInt(v.now)) {
+    return {
+      report: parseReport(v.report),
+      debug_log: parseDebugLog(v.debug_log),
+      log_level: v.log_level,
+      now: v.now,
+    };
+  }
+  return bad();
+}
+
+export function parseLogs(v: unknown): LogChunk {
+  if (
+    isObject(v) &&
+    Array.isArray(v.lines) &&
+    isInt(v.next) &&
+    isInt(v.dropped) &&
+    v.lines.every((l: unknown) => isObject(l) && isInt(l.seq) && isString(l.text))
+  ) {
+    return {
+      lines: (v.lines as { seq: number; text: string }[]).map((l) => ({ seq: l.seq, text: l.text })),
+      next: v.next,
+      dropped: v.dropped,
+    };
+  }
+  return bad();
+}
+
 export function parseLogout(v: unknown): LogoutResponse {
   if (isObject(v) && isString(v.logout_url)) return { logout_url: v.logout_url };
   return bad();
@@ -491,6 +595,33 @@ export class ApiClient {
   /** Drops the override; the `.env` defaults apply again. */
   async resetSettings(): Promise<SettingsResponse> {
     return parseSettings(await this.send("DELETE", "/api/settings"));
+  }
+
+  async telemetry(): Promise<Telemetry> {
+    return parseTelemetry(await this.get("/api/ingress/telemetry"));
+  }
+
+  /** Log lines with seq >= after (0 = everything the server holds). */
+  async logs(after = 0): Promise<LogChunk> {
+    const a = Math.max(0, Math.floor(after));
+    return parseLogs(await this.get(`/api/ingress/logs?after=${a}`));
+  }
+
+  async clearLogs(): Promise<LogChunk> {
+    return parseLogs(await this.send("DELETE", "/api/ingress/logs"));
+  }
+
+  /** Raise the ingress' sing-box log level for `minutes`; it reverts to warn by itself. */
+  async setDebugLog(level: DebugLogLevel, minutes: number): Promise<Telemetry> {
+    const m = Math.floor(minutes);
+    if (!Number.isFinite(m) || m < 1 || m > 1440) {
+      throw new ApiError(0, "bad_request", "Minutes must be between 1 and 1440.");
+    }
+    return parseTelemetry(await this.send("PUT", "/api/settings/debug-log", { level, minutes: m }));
+  }
+
+  async clearDebugLog(): Promise<Telemetry> {
+    return parseTelemetry(await this.send("DELETE", "/api/settings/debug-log"));
   }
 
   /** Destroys the session. Does not trigger onUnauthorized. */

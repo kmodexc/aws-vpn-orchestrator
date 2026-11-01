@@ -14,6 +14,7 @@ use crate::orchestrator::Orchestrator;
 use crate::providers::{self, IngressProvider};
 use crate::settings::ProtocolSettings;
 use crate::state::StateStore;
+use crate::telemetry::Telemetry;
 
 pub struct AppInner {
     pub config: Arc<Config>,
@@ -22,6 +23,8 @@ pub struct AppInner {
     pub orchestrator: Arc<Orchestrator>,
     pub limiter: RateLimiter,
     pub static_files: StaticFiles,
+    /// Counters and recent log lines reported by the ingress (memory only).
+    pub telemetry: Telemetry,
 }
 
 /// Cheaply clonable handle to the shared application state.
@@ -70,6 +73,7 @@ impl AppState {
             orchestrator,
             limiter: RateLimiter::default(),
             static_files,
+            telemetry: Telemetry::default(),
         })))
     }
 
@@ -77,6 +81,20 @@ impl AppState {
     pub async fn protocol_settings(&self) -> ProtocolSettings {
         let stored = self.orchestrator.store().snapshot().await.protocol;
         ProtocolSettings::effective(&self.config, stored.as_ref())
+    }
+
+    /// The sing-box config as served to the ingress right now: JSON bytes and their SHA-256.
+    /// Both `/i/{token}/config.json` and the report reply use this, so the hash the ingress
+    /// computes over the downloaded file is comparable.
+    pub async fn served_config(&self) -> (Vec<u8>, String) {
+        let snap = self.orchestrator.store().snapshot().await;
+        let settings = ProtocolSettings::effective(&self.config, snap.protocol.as_ref());
+        let level = crate::settings::log_level(snap.debug_log.as_ref(), crate::util::unix_now());
+        let value = crate::singbox::server_config_with(&self.config, &settings, level);
+        // serde_json's default Map is ordered, so the bytes are stable for equal input.
+        let bytes = serde_json::to_vec(&value).unwrap_or_default();
+        let hash = hex::encode(crate::util::sha256(&bytes));
+        (bytes, hash)
     }
 }
 

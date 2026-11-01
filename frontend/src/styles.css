@@ -691,6 +691,58 @@ p {
   gap: 8px;
 }
 
+.settings__actions--end {
+  align-items: end;
+}
+
+.inline-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+}
+
+.inline-fields .field {
+  flex: 1 1 220px;
+}
+
+.inline-fields .field--narrow {
+  flex: 0 1 120px;
+}
+
+.field select {
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+}
+
+.warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* ---------- ingress log ---------- */
+
+.log {
+  max-height: 50vh;
+  min-height: 8em;
+  overflow: auto;
+  margin: 12px 0 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     transition: none !important;

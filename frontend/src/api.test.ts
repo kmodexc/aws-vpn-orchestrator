@@ -293,6 +293,55 @@ describe("ApiClient", () => {
     expect((await api.events())[0]?.action).toBe("settings");
   });
 
+  it("parses telemetry and log chunks, validates the debug-log request", async () => {
+    const telemetry = {
+      report: {
+        last_report_at: 1_700_000_000,
+        version: "1.14.4",
+        uptime_s: 120,
+        connections: 3,
+        upload_total: 1000,
+        download_total: 5000,
+        upload_24h: 1000,
+        download_24h: 5000,
+        config_sha256: "ab".repeat(32),
+        log_lines: 2,
+        log_dropped: 0,
+      },
+      debug_log: { level: "info", until: 1_700_001_800 },
+      log_level: "info",
+      now: 1_700_000_060,
+    };
+    const f = vi.fn<FetchLike>();
+    f.mockResolvedValueOnce(jsonResponse(200, ME));
+    f.mockResolvedValueOnce(jsonResponse(200, telemetry));
+    f.mockResolvedValueOnce(
+      jsonResponse(200, { lines: [{ seq: 7, text: "x" }], next: 8, dropped: 1 }),
+    );
+    f.mockResolvedValueOnce(jsonResponse(200, { ...telemetry, debug_log: null, log_level: "warn" }));
+    const api = new ApiClient({ fetch: f });
+    await api.me();
+    const t = await api.telemetry();
+    expect(t.report.connections).toBe(3);
+    expect(t.debug_log?.level).toBe("info");
+    const l = await api.logs(7);
+    expect(f.mock.calls[2]?.[0]).toBe("/api/ingress/logs?after=7");
+    expect(l.lines[0]?.text).toBe("x");
+    expect(l.next).toBe(8);
+    const cleared = await api.clearDebugLog();
+    expect(cleared.debug_log).toBeNull();
+    expect(f.mock.calls[3]?.[1]?.method).toBe("DELETE");
+    await expect(api.setDebugLog("info", 0)).rejects.toMatchObject({ code: "bad_request" });
+    await expect(api.setDebugLog("info", 5000)).rejects.toMatchObject({ code: "bad_request" });
+  });
+
+  it("rejects malformed telemetry", async () => {
+    const api = new ApiClient({
+      fetch: mockFetch(jsonResponse(200, { report: { connections: "3" }, debug_log: null, log_level: "warn", now: 1 })),
+    });
+    await expect(api.telemetry()).rejects.toMatchObject({ code: "bad_response" });
+  });
+
   it("does not trigger onUnauthorized on logout", async () => {
     const onUnauthorized = vi.fn();
     const api = new ApiClient({

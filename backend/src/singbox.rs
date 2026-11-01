@@ -6,7 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::settings::{ProtocolSettings, salamander_password};
+use crate::settings::{DEFAULT_LOG_LEVEL, ProtocolSettings, clash_api_secret, salamander_password};
 use crate::util::b64std;
 
 /// Everything except RFC 3986 "unreserved" characters is percent-encoded.
@@ -31,6 +31,11 @@ fn pem_lines(pem: &str) -> Vec<String> {
 /// The sing-box (>= 1.12) server configuration pulled by the ingress (on boot and every
 /// 10 minutes). Disabled protocols have no inbound, so nothing answers on their ports.
 pub fn server_config(cfg: &Config, s: &ProtocolSettings) -> Value {
+    server_config_with(cfg, s, DEFAULT_LOG_LEVEL)
+}
+
+/// Like [`server_config`], with an explicit sing-box log level (debug logging).
+pub fn server_config_with(cfg: &Config, s: &ProtocolSettings, log_level: &str) -> Value {
     let p = &cfg.proxy;
     let mut inbounds = vec![json!({
         "type": "vless",
@@ -80,11 +85,19 @@ pub fn server_config(cfg: &Config, s: &ProtocolSettings) -> Value {
         }));
     }
     let mut config = json!({
-        "log": {"level": "warn"},
+        "log": {"level": log_level, "timestamp": true},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": inbounds,
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct", "default_domain_resolver": "local"}
+        "route": {"final": "direct", "default_domain_resolver": "local"},
+        // Local stats API for the reporter on the ingress (connections, traffic). Loopback
+        // only; the reporter derives the same secret from INGRESS_TOKEN.
+        "experimental": {
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": clash_api_secret(cfg),
+            }
+        }
     });
 
     if let Some(peer) = cfg
@@ -251,6 +264,19 @@ mod tests {
         let cfg = config(&[]);
         let c = server_config(&cfg, &defaults(&cfg));
         assert_eq!(c["route"]["final"], "direct");
+        assert_eq!(c["log"]["level"], "warn");
+        assert_eq!(
+            c["experimental"]["clash_api"]["external_controller"],
+            "127.0.0.1:9090"
+        );
+        assert_eq!(
+            c["experimental"]["clash_api"]["secret"],
+            clash_api_secret(&cfg).as_str()
+        );
+        assert_eq!(
+            server_config_with(&cfg, &defaults(&cfg), "debug")["log"]["level"],
+            "debug"
+        );
         assert_eq!(c["route"]["default_domain_resolver"], "local");
         assert!(c.get("endpoints").is_none());
         let inbounds = c["inbounds"].as_array().unwrap();

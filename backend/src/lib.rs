@@ -16,6 +16,7 @@ pub mod secret;
 pub mod settings;
 pub mod singbox;
 pub mod state;
+pub mod telemetry;
 pub mod util;
 
 pub use app::AppState;

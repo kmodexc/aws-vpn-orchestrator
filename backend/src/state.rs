@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::settings::ProtocolSettings;
+use crate::settings::{DebugLog, ProtocolSettings};
 use crate::util::{random_bytes, unix_now};
 
 pub const MAX_EVENTS: usize = 500;
@@ -45,6 +45,9 @@ pub struct PersistedState {
     /// Override of the `.env` protocol defaults (`/api/settings`); `None` = use `.env`.
     #[serde(default)]
     pub protocol: Option<ProtocolSettings>,
+    /// Temporary sing-box log level (`/api/settings/debug-log`); ignored once `until` passed.
+    #[serde(default)]
+    pub debug_log: Option<DebugLog>,
 }
 
 impl PersistedState {

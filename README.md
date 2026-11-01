@@ -306,6 +306,8 @@ After every IP rotation the clients pick up the new address on their next subscr
 | Upgrade | `git pull`, set `VPN_CONTROL_IMAGE` in `.env` to the new `sha-<commit>` tag, then `docker compose pull && docker compose up -d`. Roll back by setting the previous tag. Review the diff first (including `deploy/apache/vpn-control.conf` against your installed site file). Apache and certbot are updated by the host's package manager. |
 | Rotate secrets | See [docs/security.md → Secret rotation](docs/security.md#secret-rotation). |
 | Update sing-box on the ingress | bump `SING_BOX_VERSION` + checksums in `bootstrap.sh`, re-run it on the ingress. |
+| Ingress stopped reporting | *Ingress health* shows the last report; on the ingress: `systemctl status sing-box-report.timer`, `journalctl -u sing-box-report -n 20`. A report needs the control plane reachable from the ingress. |
+| Debug a connection problem | *Ingress health* → log level `info` for 30 min, reproduce, read *Ingress log* (filter e.g. `reality` or your client's IP), then *Back to warn now*. |
 | Certificates | Renewed automatically by certbot's systemd timer (`systemctl list-timers | grep certbot`); Apache is reloaded after renewal. |
 | Stop everything | `docker compose down` (volumes are kept; `down -v` deletes the state). Optionally `sudo a2dissite vpn-control && sudo systemctl reload apache2`. |
 
@@ -367,6 +369,42 @@ a change in the UI overrides them until *Reset to .env*. The ingress picks a cha
 10 minutes (it pulls its config on a timer); clients pick it up on their next subscription
 refresh. VLESS-REALITY is always on. Ports stay in `.env`, because changing one also needs the
 Lightsail firewall and the ingress' ufw. Every change is recorded in the event log.
+
+### Ingress health and logs
+
+The ingress reports to the control plane once a minute (`sing-box-report.timer`, installed by
+`bootstrap.sh`): active connections, traffic, sing-box version and uptime, plus the journal
+lines of `sing-box.service` since its last report. The dashboard shows this in two cards:
+
+- **Ingress health** — last report (a warning after 25 minutes without one), connections,
+  traffic of the last 24 h, version/uptime, current log level. Here an admin can raise the
+  sing-box log level (`info`, `debug`, `trace`) for 1–1440 minutes; it reverts to `warn` on its
+  own. The ingress applies the change within about a minute (the report reply tells it to
+  re-pull its config), as it does for the protocol settings.
+- **Ingress log** — live tail of the reported lines with a filter. At `warn` only problems
+  appear. **At `info` and above every connection is logged with the client's address and its
+  destination**, i.e. the browsing activity of everyone using the VPN — which is why the level
+  is timed and why the control plane keeps these lines in memory only (last 2000 lines, gone on
+  restart, never in `state.json` or the app's own logs).
+
+Counters are read from sing-box's Clash-compatible API on the ingress, bound to `127.0.0.1` with
+a secret derived from `INGRESS_TOKEN`; no new port is opened. Only the ingress talks to the
+control plane, never the other way round.
+
+**Ingress created before this existed?** Install the reporter by re-running the bootstrap script
+on it once (idempotent; SSH is open from the IP you ran `setup-lightsail.sh` from):
+
+```bash
+scp -i LightsailDefaultKey-<region>.pem deploy/ingress/bootstrap.sh ubuntu@<ingress-ip>:
+ssh -i LightsailDefaultKey-<region>.pem ubuntu@<ingress-ip>
+read -rs -p 'INGRESS_TOKEN: ' INGRESS_TOKEN; echo          # from .env, never on a command line
+export INGRESS_TOKEN CONTROL_PLANE_URL=https://<DOMAIN> SSH_ALLOW_FROM=<your-ip>/32
+sudo --preserve-env=INGRESS_TOKEN,CONTROL_PLANE_URL,SSH_ALLOW_FROM bash bootstrap.sh
+unset INGRESS_TOKEN
+```
+
+A minute later the health card shows the first report. New ingresses (`setup-lightsail.sh`,
+`rebuild-lightsail.sh`) get the reporter automatically.
 
 ### What anonymous visitors see
 

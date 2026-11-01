@@ -73,6 +73,8 @@ pub fn redact_path(path: &str) -> String {
     if path == "/i" || path.starts_with("/i/") {
         return if path.ends_with("/config.json") {
             "/i/<redacted>/config.json".to_string()
+        } else if path.ends_with("/report") {
+            "/i/<redacted>/report".to_string()
         } else {
             "/i/<redacted>".to_string()
         };

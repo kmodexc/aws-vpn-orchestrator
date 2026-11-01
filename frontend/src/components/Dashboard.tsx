@@ -6,11 +6,14 @@ import {
   type EventEntry,
   type Me,
   type Status,
+  type Telemetry,
   type WireGuard,
 } from "../api";
 import { useCountdown, useNow, usePageVisible } from "../hooks";
 import { cooldownDeadline, FAST_POLL_MS, pollInterval, SLOW_POLL_MS } from "../time";
 import { EventLog } from "./EventLog";
+import { IngressCard } from "./IngressCard";
+import { LogsCard } from "./LogsCard";
 import { SettingsCard } from "./SettingsCard";
 import { StatusCard, type Action } from "./StatusCard";
 import { SubscriptionCard } from "./SubscriptionCard";
@@ -44,6 +47,8 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [wg, setWg] = useState<WireGuard | null>(null);
   const [settingsVersion, setSettingsVersion] = useState(0);
+  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [telemetryError, setTelemetryError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState<Action | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -66,9 +71,19 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
     }
   }, [api]);
 
+  const loadTelemetry = useCallback(async () => {
+    try {
+      setTelemetry(await api.telemetry());
+      setTelemetryError(null);
+    } catch (e) {
+      setTelemetryError(describeError(e));
+    }
+  }, [api]);
+
   /** Fetch status; refresh events when something changed. Returns the state (or null). */
   const loadStatus = useCallback(async (): Promise<string | null> => {
     setLoading(true);
+    void loadTelemetry();
     try {
       const s = await api.status();
       const fetchedAt = Date.now();
@@ -87,7 +102,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
     } finally {
       setLoading(false);
     }
-  }, [api, loadEvents]);
+  }, [api, loadEvents, loadTelemetry]);
 
   // Poll loop: 5 s while transitional (or just after an action), else 30 s. Paused when hidden.
   useEffect(() => {
@@ -215,6 +230,17 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
             manualRefresh();
           }}
         />
+        <IngressCard
+          api={api}
+          telemetry={telemetry}
+          error={telemetryError}
+          now={slowNow}
+          onChanged={(t) => {
+            setTelemetry(t);
+            manualRefresh();
+          }}
+        />
+        <LogsCard api={api} />
         {wg?.enabled === true && <WireGuardCard wg={wg} />}
         <EventLog events={events} error={eventsError} now={slowNow} />
       </main>

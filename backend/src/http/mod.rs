@@ -16,7 +16,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Response, header};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -82,6 +82,12 @@ pub fn router(state: AppState) -> Router {
                 .put(api::put_settings)
                 .delete(api::reset_settings),
         )
+        .route(
+            "/settings/debug-log",
+            put(api::put_debug_log).delete(api::clear_debug_log),
+        )
+        .route("/ingress/telemetry", get(api::telemetry))
+        .route("/ingress/logs", get(api::logs).delete(api::clear_logs))
         .fallback(api::not_found)
         .method_not_allowed_fallback(api::method_not_allowed);
 
@@ -97,6 +103,7 @@ pub fn router(state: AppState) -> Router {
 
     let ingress = Router::new()
         .route("/{token}/config.json", get(token_routes::ingress_config))
+        .route("/{token}/report", post(token_routes::report))
         .fallback(token_routes::not_found);
 
     // Outermost first.

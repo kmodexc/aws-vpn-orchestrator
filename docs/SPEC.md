@@ -212,7 +212,13 @@ unauthorized`, so the routes cannot be enumerated anonymously.
 | `PUT /api/settings` | admin + CSRF | body: a complete P (no unknown fields); SNIs must be public DNS names (≥ 2 labels, alphabetic TLD) → same response as GET; stored in `state.json` and logged as a `settings` event |
 | `DELETE /api/settings` | admin + CSRF | drop the override (back to `.env`) → same response as GET; logged |
 | `GET /s/{token}` | path token | `200 text/plain` base64 subscription; headers `profile-update-interval: <SUB_UPDATE_HOURS>`, `profile-title: base64:<b64(PROFILE_NAME)>`, `Cache-Control: no-store`; `503` if the ingress has no public IP |
-| `GET /i/{token}/config.json` | path token | `200 application/json` sing-box server config |
+| `GET /i/{token}/config.json` | path token | `200 application/json` sing-box server config (§7) |
+| `POST /i/{token}/report` | path token | body (JSON, `deny_unknown_fields`): `{ "version", "uptime_s": int\|null, "connections": int\|null, "upload_total": int\|null, "download_total": int\|null, "config_sha256": hex64, "log": [string, …], "log_dropped": int }` → `200 { "config_sha256": hex64, "config_stale": bool }` (`config_sha256` = SHA-256 of the bytes `/config.json` serves right now; the ingress re-pulls when `config_stale`). Counters and lines are kept **in memory only** (§5a). Wrong token: generic 404 + failure count; bad body: plain `400`; too large: plain `413` |
+| `GET /api/ingress/telemetry` | admin | `{ "report": { "last_report_at": int\|null, "version", "uptime_s", "connections", "upload_total", "download_total", "upload_24h": int, "download_24h": int, "config_sha256", "log_lines": int, "log_dropped": int }, "debug_log": { "level", "until": int } \| null, "log_level": string, "now": int }` |
+| `GET /api/ingress/logs?after=N&limit=M` | admin | `{ "lines": [{ "seq": int, "text": string }], "next": int, "dropped": int }` — lines with `seq >= N`, oldest first, `M ≤ 2000` |
+| `DELETE /api/ingress/logs` | admin + CSRF | forget all buffered lines |
+| `PUT /api/settings/debug-log` | admin + CSRF | body `{ "level": "info"\|"debug"\|"trace", "minutes": 1..1440 }` → telemetry response; stored with an expiry, logged as a `settings` event |
+| `DELETE /api/settings/debug-log` | admin + CSRF | back to `warn` now → telemetry response |
 | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout` | see §4 | |
 | any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `200` with a minimal neutral HTML page (title "Console", one link to `/auth/login?return_to=<path>`; never a redirect, so crawlers create no pending logins and a failing SSO login cannot loop), any file is a plain 404, and `/?login_error=<code>` is the same page with a short message. The site therefore shows nothing but the IdP login to anyone not signed in. |
 
@@ -221,6 +227,27 @@ cooldown. Remember the old IP as "burned". If AWS returns an IP that is burned o
 old one, rotate again (max 3 attempts). Record the event with the actor. Status is cached for
 15 s; the cache is invalidated by any operation. Operations run in their own task, so a client
 disconnect or request timeout never aborts an AWS operation half-way.
+
+### 5a. Ingress telemetry
+
+The ingress runs a reporter (`deploy/ingress/bootstrap.sh`, `sing-box-report.timer`, once a
+minute, root): it reads sing-box's counters from the local Clash-compatible API
+(`127.0.0.1:9090`, secret = `b64url(sha256("clash-api\0" + INGRESS_TOKEN))`, §7), collects the
+journal lines of `sing-box.service` since its last **successful** report (first run: the last
+200 lines; at most 300 lines / 12 000 bytes per report, older ones counted as `log_dropped`) and
+POSTs them to `/i/{token}/report`. The journal cursor advances only after a `200`, so a failed
+report loses nothing. When the reply says `config_stale`, it starts `sing-box-config.service`
+at once, so a changed setting or log level reaches the ingress within about a minute.
+
+The control plane keeps the latest counters, 48 hourly traffic buckets (deltas of the cumulative
+totals; a counter that went backwards means sing-box restarted) and the last 2000 log lines in
+memory. Nothing of this is written to disk: at log level `info` and above the lines contain
+client addresses and destinations. Control characters are stripped from lines, lines are capped
+at 1000 characters. A restart of the control plane empties the buffer.
+
+The sing-box log level is `warn` by default (§7) and can be raised to `info`/`debug`/`trace`
+for 1–1440 minutes by an admin; `state.json` stores `{ level, until }` and the served config
+falls back to `warn` once `until` has passed, with no further action needed.
 
 ## 6. Ingress providers (Rust trait)
 
@@ -252,9 +279,12 @@ AWS errors are logged with full detail server-side and surface to clients as `un
 
 ## 7. sing-box server config (`/i/{token}/config.json`) — target sing-box ≥ 1.12
 
-The ingress pulls it on boot and every 10 minutes. `REALITY_SNI`, `HY2_SNI` and which inbounds
-exist come from the effective protocol settings (§5 `/api/settings`): the VLESS inbound always
-exists; the Hysteria2 inbound only with `hysteria2`, and with `hy2_obfs` it gets
+The ingress pulls it on boot, every 10 minutes, and at once when a report reply says the config
+is stale (§5a). `log.level` is `warn` unless a debug level is active (§5a); `log.timestamp` is
+on. `experimental.clash_api` is always present: `external_controller = "127.0.0.1:9090"` with
+the derived secret, so the reporter can read connection and traffic counters — loopback only,
+never exposed. `REALITY_SNI`, `HY2_SNI` and which inbounds exist come from the effective protocol
+settings (§5 `/api/settings`): the VLESS inbound always exists; the Hysteria2 inbound only with `hysteria2`, and with `hy2_obfs` it gets
 `"obfs": {"type": "salamander", "password": <b64url(sha256("hysteria2-salamander\0" + HY2_PASSWORD))>}`;
 the Shadowsocks inbound only with `shadowsocks`.
 
@@ -298,8 +328,9 @@ are never published.
 
 ## 9. Persistent state
 
-`STATE_DIR/state.json` holds `{ events: [... max 500], burned_ips: [... max 500], last_rotation_at, protocol }`
-(`protocol`: the `/api/settings` override or absent).
+`STATE_DIR/state.json` holds `{ events: [... max 500], burned_ips: [... max 500], last_rotation_at, protocol, debug_log }`
+(`protocol`: the `/api/settings` override or absent; `debug_log`: `{ level, until }` or absent).
+Telemetry and log lines (§5a) are deliberately **not** persisted.
 Writes are atomic (temp file + rename) with file mode 0600. It holds no secrets.
 
 ## 10. Security requirements (non-negotiable)

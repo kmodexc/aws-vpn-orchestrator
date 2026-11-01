@@ -306,6 +306,8 @@ async fn user_role_sees_only_the_subscription() {
         "/api/events",
         "/api/wireguard",
         "/api/settings",
+        "/api/ingress/telemetry",
+        "/api/ingress/logs",
     ] {
         let resp = app.get_with_session(uri, &cookie).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
@@ -1263,4 +1265,208 @@ async fn settings_updates_are_validated_and_protected() {
     // nothing was stored
     let v = body_json(app.get_with_session("/api/settings", &cookie).await).await;
     assert_eq!(v["overridden"], false);
+}
+
+fn report_body(hash: &str, log: &[&str]) -> String {
+    serde_json::json!({
+        "version": "1.14.4",
+        "uptime_s": 120,
+        "connections": 3,
+        "upload_total": 1000,
+        "download_total": 5000,
+        "config_sha256": hash,
+        "log": log,
+        "log_dropped": 0,
+    })
+    .to_string()
+}
+
+impl TestApp {
+    async fn post_report(&self, token: &str, body: &str) -> Response {
+        self.send(
+            request(Method::POST, &format!("/i/{token}/report"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn config_hash(&self) -> String {
+        let resp = self
+            .get(&format!("/i/{}/config.json", self.ingress_token))
+            .await;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        hex::encode(vpn_control::util::sha256(&bytes))
+    }
+}
+
+#[tokio::test]
+async fn ingress_reports_feed_telemetry_and_logs() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    // wrong token: generic 404, no telemetry
+    let resp = app
+        .post_report(
+            "wrong-token-wrong-token-wrong-token-yy",
+            &report_body(&"a".repeat(64), &[]),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let t = body_json(
+        app.get_with_session("/api/ingress/telemetry", &cookie)
+            .await,
+    )
+    .await;
+    assert!(t["report"]["last_report_at"].is_null());
+    assert_eq!(t["log_level"], "warn");
+
+    // a valid report with the current config hash
+    let hash = app.config_hash().await;
+    let resp = app
+        .post_report(
+            &app.ingress_token,
+            &report_body(&hash, &["first \u{1b}[31mline\u{1b}[0m", "second"]),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reply = body_json(resp).await;
+    assert_eq!(reply["config_stale"], false);
+    assert_eq!(reply["config_sha256"], hash.as_str());
+
+    let t = body_json(
+        app.get_with_session("/api/ingress/telemetry", &cookie)
+            .await,
+    )
+    .await;
+    assert_eq!(t["report"]["connections"], 3);
+    assert_eq!(t["report"]["download_24h"], 5000);
+    assert_eq!(t["report"]["version"], "1.14.4");
+    assert_eq!(t["report"]["log_lines"], 2);
+
+    let l = body_json(app.get_with_session("/api/ingress/logs", &cookie).await).await;
+    assert_eq!(l["lines"][0]["text"], "first [31mline[0m");
+    assert_eq!(l["lines"][1]["seq"], 1);
+    assert_eq!(l["next"], 2);
+    let l = body_json(
+        app.get_with_session("/api/ingress/logs?after=2", &cookie)
+            .await,
+    )
+    .await;
+    assert_eq!(l["lines"].as_array().unwrap().len(), 0);
+    assert_eq!(l["next"], 2);
+
+    // the log level is raised through the UI; the served config changes and the report
+    // reply flags the old hash as stale
+    let resp = app
+        .send(
+            request(Method::PUT, "/api/settings/debug-log")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"level":"info","minutes":30}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t = body_json(resp).await;
+    assert_eq!(t["log_level"], "info");
+    assert!(t["debug_log"]["until"].as_i64().unwrap() > t["now"].as_i64().unwrap());
+    let cfg = body_json(
+        app.get(&format!("/i/{}/config.json", app.ingress_token))
+            .await,
+    )
+    .await;
+    assert_eq!(cfg["log"]["level"], "info");
+    let reply = body_json(
+        app.post_report(&app.ingress_token, &report_body(&hash, &[]))
+            .await,
+    )
+    .await;
+    assert_eq!(reply["config_stale"], true);
+    assert_ne!(reply["config_sha256"], hash.as_str());
+
+    // and back to warn; the change is in the event log
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/settings/debug-log")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["log_level"], "warn");
+    assert_eq!(app.config_hash().await, hash);
+    let events = body_json(app.get_with_session("/api/events", &cookie).await).await;
+    assert_eq!(events[0]["action"], "settings");
+    assert!(
+        events[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("back to warn")
+    );
+    assert!(
+        events[1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("info for 30 min")
+    );
+
+    // invalid requests
+    for bad in [
+        r#"{"level":"warn","minutes":10}"#,
+        r#"{"level":"info","minutes":0}"#,
+        r#"{"level":"info","minutes":100000}"#,
+        r#"{"level":"info"}"#,
+        r#"{"level":"info","minutes":5,"x":1}"#,
+    ] {
+        let resp = app
+            .send(
+                request(Method::PUT, "/api/settings/debug-log")
+                    .header(header::COOKIE, session_cookie(&cookie))
+                    .header("x-csrf-token", &csrf)
+                    .header(header::ORIGIN, BASE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    for bad in [
+        "not json".to_string(),
+        r#"{"version":"x"}"#.to_string(),
+        report_body("nothex", &[]),
+        report_body(&hash, &[]).replace("\"log_dropped\":0", "\"log_dropped\":0,\"extra\":1"),
+    ] {
+        let resp = app.post_report(&app.ingress_token, &bad).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let big = report_body(&hash, &[&"x".repeat(20_000)]);
+    let resp = app.post_report(&app.ingress_token, &big).await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // clearing the log buffer
+    let resp = app
+        .send(
+            request(Method::DELETE, "/api/ingress/logs")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let t = body_json(
+        app.get_with_session("/api/ingress/telemetry", &cookie)
+            .await,
+    )
+    .await;
+    assert_eq!(t["report"]["log_lines"], 0);
 }

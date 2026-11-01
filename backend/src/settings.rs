@@ -84,6 +84,59 @@ fn is_public_host_name(s: &str) -> bool {
             .is_some_and(|tld| tld.bytes().any(|b| b.is_ascii_alphabetic()))
 }
 
+/// Default sing-box log level: errors and warnings only — no connection records on the ingress.
+pub const DEFAULT_LOG_LEVEL: &str = "warn";
+pub const DEBUG_LOG_LEVELS: [&str; 3] = ["info", "debug", "trace"];
+pub const MAX_DEBUG_MINUTES: u32 = 24 * 60;
+
+/// A temporary, more verbose sing-box log level. `info` and above log every connection with
+/// client address and destination, so it always expires by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugLog {
+    pub level: String,
+    /// Unix seconds; the level reverts to [`DEFAULT_LOG_LEVEL`] when this has passed.
+    pub until: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugLogRequest {
+    pub level: String,
+    pub minutes: u32,
+}
+
+impl DebugLogRequest {
+    pub fn validate(self, now: i64) -> Result<DebugLog, &'static str> {
+        let level = self.level.trim().to_ascii_lowercase();
+        if !DEBUG_LOG_LEVELS.contains(&level.as_str()) {
+            return Err("level must be info, debug or trace");
+        }
+        if self.minutes == 0 || self.minutes > MAX_DEBUG_MINUTES {
+            return Err("minutes must be between 1 and 1440");
+        }
+        Ok(DebugLog {
+            level,
+            until: now + i64::from(self.minutes) * 60,
+        })
+    }
+}
+
+/// The log level to serve now: the debug level while it lasts, else the default.
+pub fn log_level(debug: Option<&DebugLog>, now: i64) -> &str {
+    match debug {
+        Some(d) if d.until > now && DEBUG_LOG_LEVELS.contains(&d.level.as_str()) => &d.level,
+        _ => DEFAULT_LOG_LEVEL,
+    }
+}
+
+/// Secret for sing-box's local stats API (bound to 127.0.0.1 on the ingress). Derived from
+/// `INGRESS_TOKEN`, so the reporter on the ingress can derive it too and nothing new is stored.
+pub fn clash_api_secret(cfg: &Config) -> String {
+    let mut input = b"clash-api\0".to_vec();
+    input.extend_from_slice(cfg.ingress_token.expose().as_bytes());
+    b64url(&sha256(&input))
+}
+
 /// Salamander password, derived from `HY2_PASSWORD` so that no further secret has to be kept.
 pub fn salamander_password(cfg: &Config) -> String {
     let mut input = b"hysteria2-salamander\0".to_vec();
@@ -146,5 +199,37 @@ mod tests {
         assert_eq!(a, salamander_password(&cfg));
         assert_eq!(a.len(), 43);
         assert_ne!(&a, cfg.proxy.hy2_password.expose());
+    }
+
+    #[test]
+    fn debug_log_validation_and_expiry() {
+        let d = DebugLogRequest {
+            level: " INFO ".into(),
+            minutes: 30,
+        }
+        .validate(1000)
+        .unwrap();
+        assert_eq!(d.level, "info");
+        assert_eq!(d.until, 1000 + 30 * 60);
+        assert_eq!(log_level(Some(&d), 1000), "info");
+        assert_eq!(log_level(Some(&d), 1000 + 30 * 60), "warn");
+        assert_eq!(log_level(None, 0), "warn");
+        for (level, minutes) in [("warn", 10), ("error", 10), ("info", 0), ("info", 1441)] {
+            assert!(
+                DebugLogRequest {
+                    level: level.into(),
+                    minutes
+                }
+                .validate(0)
+                .is_err(),
+                "{level} {minutes}"
+            );
+        }
+        // a stored level that is no longer allowed never leaks through
+        let bogus = DebugLog {
+            level: "panic".into(),
+            until: i64::MAX,
+        };
+        assert_eq!(log_level(Some(&bogus), 0), "warn");
     }
 }
