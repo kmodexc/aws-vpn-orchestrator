@@ -543,14 +543,24 @@ on termination. T3/T4g CPU credits are set to standard to avoid surplus-credit c
 disk, IPv4 and applicable traffic are separately billed while resources exist. No Elastic IP,
 NAT gateway, snapshot or load balancer is created by the app.
 
-1. Prepare a public subnet and security group in each selected region using your admin identity.
-   The subnet must have a direct default route through an internet gateway; the groups must
-   belong to that subnet's VPC and allow exactly the configured proxy ports from `0.0.0.0/0`
-   (default TCP 443, UDP 443, TCP/UDP 8443). No SSH rule is needed. Ensure outbound HTTPS/DNS
-   and package downloads work. The runtime identity cannot create or alter these networks.
-2. Choose an available Canonical Ubuntu 24.04 server AMI per region. Canonical's owner account
-   is `099720109477`. Use amd64 with `t3.nano`/`t3.micro`, arm64 with `t4g.nano`/`t4g.micro`.
-   For example, this read-only command lists the latest amd64 image in Hong Kong:
+1. Prepare the public networking in each selected region using your admin identity. The repository
+   includes an idempotent helper that creates a dedicated VPC, public subnet, internet gateway,
+   route table and security group, discovers a matching Canonical AMI, attaches the provisioning
+   policy and updates `.env`:
+
+   ```bash
+   deploy/aws/setup-ec2.sh --profile default --regions ap-east-1
+   ```
+
+   Pass multiple comma-separated regions to prepare them all. It creates only the exact configured
+   proxy rules (default TCP 443, UDP 443, TCP/UDP 8443); no SSH rule is added because the runtime
+   preflight rejects extra inbound rules. The script does not launch an instance: the application
+   does that after you select a region. It never deletes the tagged networking resources it creates.
+   Ensure outbound HTTPS/DNS and package downloads work. The runtime identity cannot create or
+   alter these networks.
+2. The helper selects the latest available Canonical Ubuntu 24.04 server AMI per region.
+   Canonical's owner account is `099720109477`; amd64 is selected for `t3.nano`/`t3.micro`,
+   arm64 for `t4g.nano`/`t4g.micro`. To inspect the selection manually:
 
    ```bash
    aws ec2 describe-images --profile default --region ap-east-1 --owners 099720109477 \
