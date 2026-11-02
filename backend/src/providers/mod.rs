@@ -5,13 +5,14 @@ pub mod ec2;
 pub mod fake;
 pub mod lightsail;
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, ProviderConfig, ProviderKind};
 
 /// Prefix for resources this application allocates and may therefore release.
 pub const MANAGED_PREFIX: &str = "vpn-orchestrator-";
@@ -71,7 +72,10 @@ async fn aws_sdk_config(region: &str) -> aws_config::SdkConfig {
 
 /// Build the provider selected by `PROVIDER`.
 pub async fn build(cfg: &Config) -> anyhow::Result<Arc<dyn IngressProvider>> {
-    let p = &cfg.provider;
+    build_one(&cfg.provider).await
+}
+
+async fn build_one(p: &ProviderConfig) -> anyhow::Result<Arc<dyn IngressProvider>> {
     match p.kind {
         ProviderKind::Fake => {
             tracing::warn!(
@@ -92,6 +96,19 @@ pub async fn build(cfg: &Config) -> anyhow::Result<Arc<dyn IngressProvider>> {
             }
         }
     }
+}
+
+/// Build all configured targets. Each AWS SDK client is pinned to the target's region; this is
+/// what lets the control plane switch between already-provisioned regions without restarting.
+pub async fn build_all(
+    cfg: &Config,
+) -> anyhow::Result<HashMap<String, Arc<dyn IngressProvider>>> {
+    let mut providers = HashMap::with_capacity(cfg.targets.len());
+    for target in &cfg.targets {
+        let provider = build_one(&target.provider).await?;
+        providers.insert(target.id.clone(), provider);
+    }
+    Ok(providers)
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ use serde_json::json;
 use crate::app::AppState;
 use crate::auth::{self, Admin, Principal};
 use crate::error::ApiError;
+use crate::orchestrator::TargetView;
 use crate::settings::{DebugLog, DebugLogRequest, ProtocolSettings, SettingsUpdate, log_level};
 use crate::singbox;
 use crate::state::{Event, EventAction};
@@ -50,6 +51,13 @@ pub async fn status(State(state): State<AppState>, _p: Admin) -> Result<Response
     Ok(Json(state.orchestrator.status_view().await?).into_response())
 }
 
+pub async fn targets(
+    State(state): State<AppState>,
+    _p: Admin,
+) -> Result<Json<Vec<TargetView>>, ApiError> {
+    Ok(Json(state.orchestrator.targets().await))
+}
+
 fn accepted() -> Response {
     (StatusCode::ACCEPTED, Json(json!({"ok": true}))).into_response()
 }
@@ -62,6 +70,14 @@ pub struct EmptyRequest {}
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RotateRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchRequest {
+    pub target_id: String,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -156,6 +172,46 @@ pub async fn rotate(
     };
     let ip = state.orchestrator.rotate(p.actor(), reason).await?;
     Ok(Json(json!({"public_ip": ip.to_string()})).into_response())
+}
+
+pub async fn switch(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<crate::orchestrator::StatusView>, ApiError> {
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge
+        } else {
+            ApiError::BadRequest("cannot read request body")
+        }
+    })?;
+    let req: SwitchRequest = parse_json_body(&headers, &body)?;
+    if req.target_id.is_empty()
+        || req.target_id.len() > 32
+        || !req
+            .target_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(ApiError::BadRequest("target_id is invalid"));
+    }
+    let reason = match req.reason {
+        Some(r) if r.chars().count() > MAX_REASON_CHARS => {
+            return Err(ApiError::BadRequest(
+                "reason must be at most 200 characters",
+            ));
+        }
+        Some(r) => Some(sanitize_text(r.trim(), MAX_REASON_CHARS)),
+        None => None,
+    };
+    Ok(Json(
+        state
+            .orchestrator
+            .switch(req.target_id, p.actor(), reason)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

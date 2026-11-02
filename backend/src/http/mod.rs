@@ -70,6 +70,8 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/me", get(api::me))
         .route("/status", get(api::status))
+        .route("/ingress/targets", get(api::targets))
+        .route("/ingress/switch", post(api::switch))
         .route("/ingress/start", post(api::start))
         .route("/ingress/stop", post(api::stop))
         .route("/ingress/rotate", post(api::rotate))

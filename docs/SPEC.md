@@ -84,6 +84,7 @@ The backend binary `vpn-control` has these subcommands (no subcommand = `serve`)
 | `AWS_ACCESS_KEY_ID` | yes* | – | secret; used by the AWS SDK default chain |
 | `AWS_SECRET_ACCESS_KEY` | yes* | – | secret |
 | `INGRESS_INSTANCE` | yes* | – | Lightsail instance name or EC2 instance id |
+| `INGRESS_TARGETS` | no | unset | optional semicolon-separated `id|provider|region|instance` targets for phone-triggered promotion; targets must already exist |
 | `ROTATE_COOLDOWN_S` | no | `120` | |
 | `SUB_TOKEN` | yes | – | secret, ≥ 32 chars, `[A-Za-z0-9_-]` |
 | `INGRESS_TOKEN` | yes | – | secret, ≥ 32 chars, `[A-Za-z0-9_-]`, must differ from `SUB_TOKEN` |
@@ -202,10 +203,12 @@ unauthorized`, so the routes cannot be enumerated anonymously.
 | `GET /healthz` | none | `200 ok` (text/plain); no other info |
 | `GET /api/me` | session or bearer (any role) | `{ "sub", "username", "email": string\|null, "roles": [..], "csrf_token": string\|null, "is_admin": bool }` (csrf_token null for bearer); 401 if not logged in |
 | `GET /api/status` | admin | `{ "provider", "region", "instance", "state", "public_ip": string\|null, "cooldown_remaining_s": int, "last_rotation_at": int\|null (unix s) }` |
+| `GET /api/ingress/targets` | admin | `[{ "id", "provider", "region", "instance", "active": bool }, …]` for configured targets |
+| `POST /api/ingress/switch` | admin + CSRF | body `{ "target_id": string, "reason"?: string ≤ 200 chars }` → the promoted target's status; `409` if another operation is running |
 | `POST /api/ingress/start` | admin + CSRF | `202 {"ok": true}` |
 | `POST /api/ingress/stop` | admin + CSRF | `202 {"ok": true}` |
 | `POST /api/ingress/rotate` | admin + CSRF | body `{"reason"?: string ≤ 200 chars}` → `200 {"public_ip": "…"}`; `429 {"error":"cooldown","message", "retry_after_s": int}` + `Retry-After`; `409 conflict` if another operation is running |
-| `GET /api/events?limit=N` | admin | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"settings"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
+| `GET /api/events?limit=N` | admin | `[{ "at": int, "action": "start"\|"stop"\|"rotate"\|"switch"\|"settings"\|"error", "ip": string\|null, "detail": string, "actor": string }]`, newest first, N ≤ 200, default 50 |
 | `GET /api/subscription` | any role | `{ "url": "<PUBLIC_BASE_URL>/s/<SUB_TOKEN>", "links": [string, …] \| null }` (links null when there is no public IP) |
 | `GET /api/wireguard` | admin | `{ "enabled": bool, "ingress_public_key": string\|null, "ingress_address": string, "vps_peer_snippet": string\|null }` |
 | `GET /api/settings` | admin | `{ "settings": P, "defaults": P, "overridden": bool, "ports": { "vless_tcp", "hy2_udp", "ss" } }` with P = `{ "reality_sni", "hy2_sni", "hysteria2": bool, "hy2_obfs": bool, "shadowsocks": bool }`; `settings` = in effect, `defaults` = from `.env` |
@@ -222,7 +225,9 @@ unauthorized`, so the routes cannot be enumerated anonymously.
 | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout` | see §4 | |
 | any other GET | session | SPA: existing file from `STATIC_DIR`, else `index.html` (for client-side routes). `/api/*`, `/auth/*`, `/s/*`, `/i/*` never fall back to index.html → 404 JSON / plain 404. **Without a valid session nothing from `STATIC_DIR` is served:** a page path answers `200` with a minimal neutral HTML page (title "Console", one link to `/auth/login?return_to=<path>`; never a redirect, so crawlers create no pending logins and a failing SSO login cannot loop), any file is a plain 404, and `/?login_error=<code>` is the same page with a short message. The site therefore shows nothing but the IdP login to anyone not signed in. |
 
-Only one start/stop/rotate runs at a time (a mutex; if busy → 409). Rotation: refuse while in
+Only one start/stop/rotate/switch runs at a time (a mutex; if busy → 409). A switch only promotes
+a configured, pre-provisioned target after a status check; it does not create or delete instances.
+Rotation: refuse while in
 cooldown. Remember the old IP as "burned". If AWS returns an IP that is burned or equal to the
 old one, rotate again (max 3 attempts). Record the event with the actor. Status is cached for
 15 s; the cache is invalidated by any operation. Operations run in their own task, so a client
@@ -392,6 +397,7 @@ React 18+ with TypeScript (strict) and Vite, no UI framework required. Plain CSS
   Show a `login_error` query param as a friendly message.
 - Dashboard (403 → "Your account lacks the required role" screen with logout):
   - status card: state badge, public IP, provider/region/instance, cooldown countdown, last rotation;
+  - ingress-region card: configured targets and an authenticated, confirmation-protected switch action;
     poll every 5 s while the state is transitional (pending/stopping/starting), else every 30 s
   - action buttons: Start, Stop, **Rotate IP** (asks for confirmation, optional reason input),
     disabled while busy or in cooldown, with errors shown inline

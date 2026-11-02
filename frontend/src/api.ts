@@ -41,6 +41,14 @@ export interface Status {
   last_rotation_at: number | null;
 }
 
+export interface IngressTarget {
+  id: string;
+  provider: string;
+  region: string;
+  instance: string;
+  active: boolean;
+}
+
 export interface OkResponse {
   ok: true;
 }
@@ -49,7 +57,7 @@ export interface RotateResponse {
   public_ip: string;
 }
 
-export type EventAction = "start" | "stop" | "rotate" | "settings" | "error";
+export type EventAction = "start" | "stop" | "rotate" | "switch" | "settings" | "error";
 
 export interface EventEntry {
   at: number;
@@ -336,6 +344,33 @@ export function parseStatus(v: unknown): Status {
   return bad();
 }
 
+export function parseTargets(v: unknown): IngressTarget[] {
+  if (
+    Array.isArray(v) &&
+    v.every(
+      (item) =>
+        isObject(item) &&
+        isString(item.id) &&
+        isString(item.provider) &&
+        isString(item.region) &&
+        isString(item.instance) &&
+        typeof item.active === "boolean",
+    )
+  ) {
+    return v.map((item) => {
+      const target = item as Json;
+      return {
+        id: target.id as string,
+        provider: target.provider as string,
+        region: target.region as string,
+        instance: target.instance as string,
+        active: target.active as boolean,
+      };
+    });
+  }
+  return bad();
+}
+
 export function parseOk(v: unknown): OkResponse {
   if (isObject(v) && v.ok === true) return { ok: true };
   return bad();
@@ -346,7 +381,14 @@ export function parseRotate(v: unknown): RotateResponse {
   return bad();
 }
 
-const EVENT_ACTIONS: readonly EventAction[] = ["start", "stop", "rotate", "settings", "error"];
+const EVENT_ACTIONS: readonly EventAction[] = [
+  "start",
+  "stop",
+  "rotate",
+  "switch",
+  "settings",
+  "error",
+];
 
 function parseEvent(v: unknown): EventEntry {
   if (
@@ -558,6 +600,20 @@ export class ApiClient {
 
   async status(): Promise<Status> {
     return parseStatus(await this.get("/api/status"));
+  }
+
+  async targets(): Promise<IngressTarget[]> {
+    return parseTargets(await this.get("/api/ingress/targets"));
+  }
+
+  async switchTarget(targetId: string, reason?: string): Promise<Status> {
+    const trimmed = reason?.trim() ?? "";
+    if (trimmed.length > MAX_REASON_LENGTH) {
+      throw new ApiError(0, "bad_request", "Reason is too long.");
+    }
+    const body: { target_id: string; reason?: string } = { target_id: targetId };
+    if (trimmed !== "") body.reason = trimmed;
+    return parseStatus(await this.post("/api/ingress/switch", body));
   }
 
   async start(): Promise<OkResponse> {

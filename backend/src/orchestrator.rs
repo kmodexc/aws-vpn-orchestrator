@@ -4,6 +4,7 @@
 //! Operations run in a spawned task that owns the operation lock, so a client disconnect or a
 //! request timeout never aborts an AWS operation half-way.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,8 +14,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::error::ApiError;
 use crate::providers::{IngressProvider, IngressStatus};
-use crate::state::{EventAction, StateStore};
-use crate::util::unix_now;
+use crate::config::TargetConfig;
+use crate::state::{Event, EventAction, StateStore};
+use crate::util::{sanitize_text, unix_now};
 
 pub const STATUS_CACHE_TTL: Duration = Duration::from_secs(15);
 pub const MAX_ROTATE_ATTEMPTS: u32 = 3;
@@ -39,6 +41,15 @@ pub struct Orchestrator {
     provider_name: String,
     region: String,
     instance: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TargetView {
+    pub id: String,
+    pub provider: String,
+    pub region: String,
+    pub instance: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +132,10 @@ impl Orchestrator {
         Arc::clone(&self.op_lock)
             .try_lock_owned()
             .map_err(|_| ApiError::Conflict)
+    }
+
+    pub fn busy(&self) -> bool {
+        self.op_lock.try_lock().is_err()
     }
 
     /// Wait until no operation is running (used during graceful shutdown).
@@ -263,6 +278,190 @@ impl Orchestrator {
         if let Err(e) = self.store.update(f).await {
             tracing::error!(error = %e, "failed to persist state");
         }
+    }
+}
+
+/// Coordinates several pre-provisioned ingress targets. Region changes are deliberately an
+/// explicit promotion of a configured target; provisioning and IAM changes remain outside the
+/// public control process.
+pub struct IngressManager {
+    targets: HashMap<String, Arc<Orchestrator>>,
+    views: Vec<TargetView>,
+    default_id: String,
+    store: Arc<StateStore>,
+    op_lock: Arc<Mutex<()>>,
+}
+
+impl IngressManager {
+    pub fn new(
+        configs: &[TargetConfig],
+        providers: HashMap<String, Arc<dyn IngressProvider>>,
+        store: Arc<StateStore>,
+        cooldown: Duration,
+    ) -> anyhow::Result<Self> {
+        let mut targets = HashMap::with_capacity(configs.len());
+        let mut views = Vec::with_capacity(configs.len());
+        for config in configs {
+            let provider = providers
+                .get(&config.id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing provider for target {}", config.id))?;
+            let (region, instance) = match config.provider.kind {
+                crate::config::ProviderKind::Fake => (
+                    config
+                        .provider
+                        .aws_region
+                        .clone()
+                        .unwrap_or_else(|| "local".into()),
+                    config
+                        .provider
+                        .instance
+                        .clone()
+                        .unwrap_or_else(|| "fake-ingress".into()),
+                ),
+                _ => (
+                    config.provider.aws_region.clone().unwrap_or_default(),
+                    config.provider.instance.clone().unwrap_or_default(),
+                ),
+            };
+            let orchestrator = Arc::new(Orchestrator::new(
+                provider,
+                Arc::clone(&store),
+                cooldown,
+                config.provider.kind.as_str(),
+                &region,
+                &instance,
+            ));
+            views.push(TargetView {
+                id: config.id.clone(),
+                provider: config.provider.kind.as_str().to_string(),
+                region,
+                instance,
+                active: false,
+            });
+            targets.insert(config.id.clone(), orchestrator);
+        }
+        let default_id = configs
+            .first()
+            .map(|c| c.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("at least one ingress target is required"))?;
+        Ok(Self {
+            targets,
+            views,
+            default_id,
+            store,
+            op_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub fn store(&self) -> &StateStore {
+        &self.store
+    }
+
+    async fn active_id(&self) -> String {
+        let id = self.store.snapshot().await.active_target_id;
+        match id {
+            Some(id) if self.targets.contains_key(&id) => id,
+            _ => self.default_id.clone(),
+        }
+    }
+
+    fn target(&self, id: &str) -> Result<Arc<Orchestrator>, ApiError> {
+        self.targets.get(id).cloned().ok_or(ApiError::NotFound)
+    }
+
+    fn try_acquire(&self) -> Result<OwnedMutexGuard<()>, ApiError> {
+        Arc::clone(&self.op_lock)
+            .try_lock_owned()
+            .map_err(|_| ApiError::Conflict)
+    }
+
+    pub async fn status(&self) -> Result<IngressStatus, ApiError> {
+        let id = self.active_id().await;
+        self.target(&id)?.status().await
+    }
+
+    pub async fn status_view(&self) -> Result<StatusView, ApiError> {
+        let id = self.active_id().await;
+        self.target(&id)?.status_view().await
+    }
+
+    pub async fn start(&self, actor: String) -> Result<(), ApiError> {
+        let _guard = self.try_acquire()?;
+        let id = self.active_id().await;
+        self.target(&id)?.start(actor).await
+    }
+
+    pub async fn stop(&self, actor: String) -> Result<(), ApiError> {
+        let _guard = self.try_acquire()?;
+        let id = self.active_id().await;
+        self.target(&id)?.stop(actor).await
+    }
+
+    pub async fn rotate(
+        &self,
+        actor: String,
+        reason: Option<String>,
+    ) -> Result<Ipv4Addr, ApiError> {
+        let _guard = self.try_acquire()?;
+        let id = self.active_id().await;
+        self.target(&id)?.rotate(actor, reason).await
+    }
+
+    pub async fn targets(&self) -> Vec<TargetView> {
+        let active = self.active_id().await;
+        self.views
+            .iter()
+            .cloned()
+            .map(|mut view| {
+                view.active = view.id == active;
+                view
+            })
+            .collect()
+    }
+
+    /// Promote a configured target after proving its AWS API is reachable. The target may be
+    /// stopped; this is intentional because the phone UI can then start it separately.
+    pub async fn switch(
+        &self,
+        target_id: String,
+        actor: String,
+        reason: Option<String>,
+    ) -> Result<StatusView, ApiError> {
+        let _guard = self.try_acquire()?;
+        let target = self.target(&target_id)?;
+        let current = self.active_id().await;
+        if current == target_id {
+            return target.status_view().await;
+        }
+        target
+            .status()
+            .await
+            .map_err(|e| ApiError::unavailable(format!("target health check failed: {e:#}")))?;
+        let detail = reason
+            .filter(|r| !r.trim().is_empty())
+            .map(|r| format!("{current} -> {target_id}: {}", sanitize_text(&r, 200)))
+            .unwrap_or_else(|| format!("{current} -> {target_id}"));
+        self.store
+            .update(|s| {
+                s.active_target_id = Some(target_id.clone());
+                s.push_event(Event {
+                    at: unix_now(),
+                    action: EventAction::Switch,
+                    ip: None,
+                    detail,
+                    actor,
+                });
+            })
+            .await
+            .map_err(ApiError::internal)?;
+        target.status_view().await
+    }
+
+    pub async fn wait_idle(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.op_lock.lock())
+            .await
+            .is_ok()
     }
 }
 

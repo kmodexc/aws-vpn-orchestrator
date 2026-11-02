@@ -69,13 +69,20 @@ pub struct OidcConfig {
     pub scopes: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     /// Required for AWS providers.
     pub aws_region: Option<String>,
     /// Lightsail instance name or EC2 instance id. Required for AWS providers.
     pub instance: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetConfig {
+    /// Stable identifier used by the phone UI and persisted active-target state.
+    pub id: String,
+    pub provider: ProviderConfig,
 }
 
 #[derive(Debug)]
@@ -135,6 +142,7 @@ pub struct Config {
     pub session_idle_timeout: Duration,
     pub session_absolute_timeout: Duration,
     pub provider: ProviderConfig,
+    pub targets: Vec<TargetConfig>,
     pub rotate_cooldown: Duration,
     pub sub_token: Secret<String>,
     pub ingress_token: Secret<String>,
@@ -252,6 +260,7 @@ impl Config {
         }
 
         let provider = parse_provider(&env)?;
+        let targets = parse_targets(&env, &provider)?;
         let rotate_cooldown =
             Duration::from_secs(env.num("ROTATE_COOLDOWN_S", 120u64, 0, 86_400)?);
 
@@ -287,6 +296,7 @@ impl Config {
             session_idle_timeout,
             session_absolute_timeout,
             provider,
+            targets,
             rotate_cooldown,
             sub_token: Secret::new(sub_token),
             ingress_token: Secret::new(ingress_token),
@@ -482,6 +492,113 @@ fn parse_provider<F: Fn(&str) -> Option<String>>(
         kind,
         aws_region: Some(region),
         instance: Some(instance),
+    })
+}
+
+/// Parse optional runtime targets. The legacy single-provider variables remain the default so
+/// existing installations need no migration. Multiple targets use:
+///
+/// `id|provider|region|instance;id|provider|region|instance`
+///
+/// IDs are deliberately allowlisted and the value is never accepted from the browser.
+fn parse_targets<F: Fn(&str) -> Option<String>>(
+    env: &Env<F>,
+    default: &ProviderConfig,
+) -> Result<Vec<TargetConfig>, ConfigError> {
+    let Some(raw) = env.opt("INGRESS_TARGETS") else {
+        return Ok(vec![TargetConfig {
+            id: "default".to_string(),
+            provider: default.clone(),
+        }]);
+    };
+    if raw.len() > 4096 {
+        return Err(err("INGRESS_TARGETS", "is too long"));
+    }
+    let mut targets = Vec::new();
+    for (index, item) in raw.split(';').enumerate() {
+        let fields: Vec<&str> = item.split('|').collect();
+        if fields.len() != 4 {
+            return Err(err(
+                "INGRESS_TARGETS",
+                format!("entry {} must be id|provider|region|instance", index + 1),
+            ));
+        }
+        let id = fields[0].trim();
+        if id.is_empty()
+            || id.len() > 32
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(err(
+                "INGRESS_TARGETS",
+                format!("entry {} has an invalid id", index + 1),
+            ));
+        }
+        if targets.iter().any(|t: &TargetConfig| t.id == id) {
+            return Err(err("INGRESS_TARGETS", "target ids must be unique"));
+        }
+        let provider = parse_provider_values(env, fields[1], fields[2], fields[3])
+            .map_err(|reason| err("INGRESS_TARGETS", format!("entry {}: {reason}", index + 1)))?;
+        targets.push(TargetConfig {
+            id: id.to_string(),
+            provider,
+        });
+    }
+    if targets.is_empty() {
+        return Err(err("INGRESS_TARGETS", "must contain at least one target"));
+    }
+    Ok(targets)
+}
+
+fn parse_provider_values<F: Fn(&str) -> Option<String>>(
+    env: &Env<F>,
+    raw_kind: &str,
+    raw_region: &str,
+    raw_instance: &str,
+) -> Result<ProviderConfig, String> {
+    let kind = match raw_kind.trim().to_ascii_lowercase().as_str() {
+        "lightsail" => ProviderKind::Lightsail,
+        "ec2" => ProviderKind::Ec2,
+        "fake" => ProviderKind::Fake,
+        _ => return Err("provider must be lightsail, ec2 or fake".into()),
+    };
+    let region = raw_region.trim();
+    let instance = raw_instance.trim();
+    if kind == ProviderKind::Fake {
+        return Ok(ProviderConfig {
+            kind,
+            aws_region: (!region.is_empty()).then(|| region.to_string()),
+            instance: (!instance.is_empty()).then(|| instance.to_string()),
+        });
+    }
+    if region.is_empty()
+        || region.len() > 32
+        || !region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err("region must look like eu-central-1".into());
+    }
+    // The SDK uses the default credential chain; all configured targets share the same runtime
+    // identity. Provisioning new targets remains an explicit operator/deployment action.
+    if env.opt("AWS_ACCESS_KEY_ID").is_none() || env.opt("AWS_SECRET_ACCESS_KEY").is_none() {
+        return Err("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required".into());
+    }
+    if instance.is_empty() || instance.len() > 255 || !is_visible_ascii(instance) {
+        return Err("instance must be visible ASCII, at most 255 characters".into());
+    }
+    if kind == ProviderKind::Ec2
+        && !(instance.starts_with("i-")
+            && instance[2..].bytes().all(|b| b.is_ascii_hexdigit())
+            && instance.len() > 2)
+    {
+        return Err("EC2 instance must be an instance id (i-...)".into());
+    }
+    Ok(ProviderConfig {
+        kind,
+        aws_region: Some(region.to_string()),
+        instance: Some(instance.to_string()),
     })
 }
 
@@ -880,6 +997,17 @@ pub(crate) mod tests {
         assert!(!c.wireguard.enabled);
         assert!(c.wireguard.peer.is_none());
         assert_eq!(c.proxy.hy2_cert_sha256_hex.len(), 64);
+
+        let multi = with(&[
+            (
+                "INGRESS_TARGETS",
+                "tokyo|fake|ap-northeast-1|tokyo;hongkong|fake|ap-east-1|hongkong",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(multi.targets.len(), 2);
+        assert_eq!(multi.targets[1].id, "hongkong");
+        assert_eq!(multi.targets[1].provider.aws_region.as_deref(), Some("ap-east-1"));
     }
 
     #[test]

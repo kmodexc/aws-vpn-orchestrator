@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::auth::oidc::OidcClient;
 use crate::auth::session::SessionStore;
-use crate::config::{Config, ProviderKind};
+use crate::config::Config;
 use crate::http::rate_limit::RateLimiter;
 use crate::http::static_files::StaticFiles;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::IngressManager;
 use crate::providers::{self, IngressProvider};
 use crate::settings::ProtocolSettings;
 use crate::state::StateStore;
@@ -20,7 +20,7 @@ pub struct AppInner {
     pub config: Arc<Config>,
     pub sessions: SessionStore,
     pub oidc: OidcClient,
-    pub orchestrator: Arc<Orchestrator>,
+    pub orchestrator: Arc<IngressManager>,
     pub limiter: RateLimiter,
     pub static_files: StaticFiles,
     /// Counters and recent log lines reported by the ingress (memory only).
@@ -42,6 +42,20 @@ impl Deref for AppState {
 impl AppState {
     /// Build the state. Performs no network I/O (OIDC discovery is lazy); opens the state store.
     pub fn new(config: Config, provider: Arc<dyn IngressProvider>) -> anyhow::Result<Self> {
+        let target_id = config
+            .targets
+            .first()
+            .map(|target| target.id.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let providers = std::iter::once((target_id, provider)).collect();
+        Self::new_with_providers(config, providers)
+    }
+
+    /// Build the state from one provider per configured target.
+    pub fn new_with_providers(
+        config: Config,
+        providers: std::collections::HashMap<String, Arc<dyn IngressProvider>>,
+    ) -> anyhow::Result<Self> {
         let store = Arc::new(StateStore::open(&config.state_dir)?);
         let telemetry = Telemetry::default();
         // A debug window that was running when the previous process stopped must still end —
@@ -55,25 +69,12 @@ impl AppState {
                 telemetry.schedule_purge(d.until + crate::telemetry::LOG_RETENTION_AFTER_DEBUG_S);
             }
         }
-        let p = &config.provider;
-        let (region, instance) = match p.kind {
-            ProviderKind::Fake => (
-                p.aws_region.clone().unwrap_or_else(|| "local".into()),
-                p.instance.clone().unwrap_or_else(|| "fake-ingress".into()),
-            ),
-            _ => (
-                p.aws_region.clone().unwrap_or_default(),
-                p.instance.clone().unwrap_or_default(),
-            ),
-        };
-        let orchestrator = Arc::new(Orchestrator::new(
-            provider,
-            store,
+        let orchestrator = Arc::new(IngressManager::new(
+            &config.targets,
+            providers,
+            Arc::clone(&store),
             config.rotate_cooldown,
-            p.kind.as_str(),
-            &region,
-            &instance,
-        ));
+        )?);
         let sessions =
             SessionStore::new(config.session_idle_timeout, config.session_absolute_timeout);
         let oidc = OidcClient::new(&config)?;
@@ -162,8 +163,8 @@ fn log_startup(cfg: &Config) {
 /// Run the server until SIGTERM / Ctrl-C.
 pub async fn run(config: Config) -> anyhow::Result<()> {
     log_startup(&config);
-    let provider = providers::build(&config).await?;
-    let state = AppState::new(config, provider)?;
+    let providers = providers::build_all(&config).await?;
+    let state = AppState::new_with_providers(config, providers)?;
     let app = crate::http::router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.config.bind_addr).await?;

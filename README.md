@@ -8,6 +8,7 @@ out through WireGuard to your VPS.
 From a web UI (or a Keycloak-authenticated API client) you can:
 
 - see the ingress status and start / stop it
+- switch between pre-provisioned ingress regions from the mobile-friendly dashboard
 - **rotate its public IPv4 in seconds** (swap the Lightsail static IP / EC2 Elastic IP) when the
   current one gets blocked — no reboot, no client reconfiguration
 - hand out one **subscription URL** for Hiddify, v2rayNG, NekoBox, … that always contains the
@@ -157,6 +158,22 @@ your own IP changed — and the IAM policy). `--help` lists all options.
 If you ran it on another machine, copy the updated `.env` to the VPS (`scp`, keep it 0600). The
 ingress configures itself within a few minutes and keeps retrying the config download every
 10 minutes until the control plane (step 6) answers.
+
+#### Phone-triggered region switching
+
+The dashboard can promote between already-provisioned targets without restarting the control
+server. Add `INGRESS_TARGETS` to `.env` using the format
+`id|provider|region|instance;...`, for example:
+
+```dotenv
+INGRESS_TARGETS=tokyo|lightsail|ap-northeast-1|vpn-ingress-tokyo;hongkong|lightsail|ap-east-1|vpn-ingress-hongkong
+```
+
+The control plane creates one region-pinned AWS client per target at startup. Switching is an
+explicit, authenticated, CSRF-protected promotion: it checks the candidate target, persists the
+active target, and records an audit event. It does not provision, reconfigure, or delete AWS
+instances, so create the candidates and grant the runtime IAM identity access to all of them
+before adding them. Existing clients may need to refresh their subscription after a switch.
 
 Two companion scripts:
 

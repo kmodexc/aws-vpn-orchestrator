@@ -17,6 +17,7 @@ import { LogsCard } from "./LogsCard";
 import { SettingsCard } from "./SettingsCard";
 import { StatusCard, type Action } from "./StatusCard";
 import { SubscriptionCard } from "./SubscriptionCard";
+import { TargetCard } from "./TargetCard";
 import { WireGuardCard } from "./WireGuardCard";
 
 interface Props {
@@ -221,6 +222,7 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
           onAction={(a, r) => void runAction(a, r)}
           onRefresh={manualRefresh}
         />
+        <TargetCard api={api} onChanged={manualRefresh} />
         <SubscriptionCard
           api={api}
           ipKey={status?.public_ip ?? null}

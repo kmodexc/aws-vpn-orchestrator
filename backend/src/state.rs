@@ -21,6 +21,7 @@ pub enum EventAction {
     Start,
     Stop,
     Rotate,
+    Switch,
     Settings,
     Error,
 }
@@ -48,6 +49,9 @@ pub struct PersistedState {
     /// Temporary sing-box log level (`/api/settings/debug-log`); ignored once `until` passed.
     #[serde(default)]
     pub debug_log: Option<DebugLog>,
+    /// Active configured ingress target. `None` keeps legacy installations on their first target.
+    #[serde(default)]
+    pub active_target_id: Option<String>,
 }
 
 impl PersistedState {
