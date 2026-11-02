@@ -1,9 +1,13 @@
-# Allow-list: the build context contains ONLY what the Dockerfile needs (backend/ and frontend/).
-# Everything else — in particular .env, .git, docs and deploy material — never reaches the
-# Docker daemon and therefore can never be baked into an image layer.
+# Allow-list: the build context contains only what the Dockerfile needs (backend/, frontend/, and
+# the bootstrap script embedded by the backend). Everything else — in particular .env, .git, docs
+# and unrelated deploy material — never reaches the Docker daemon and therefore can never be baked
+# into an image layer.
 *
 !backend/
 !frontend/
+!deploy/
+!deploy/ingress/
+!deploy/ingress/bootstrap.sh
 
 # Never send secrets, even if they sit inside an allowed directory.
 **/.env
