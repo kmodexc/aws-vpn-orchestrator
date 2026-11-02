@@ -21,6 +21,7 @@ use vpn_control::auth::session::SessionData;
 use vpn_control::cli::gen_env;
 use vpn_control::config::Config;
 use vpn_control::providers::fake::FakeProvider;
+use vpn_control::providers::IngressProvider;
 
 const BASE: &str = "https://vpn.example.com";
 const INDEX_HTML: &str = "<!doctype html><title>spa</title>";
@@ -78,7 +79,18 @@ fn app_with(extra: &[(&str, &str)]) -> TestApp {
     let config = Config::from_pairs(pairs).unwrap();
     let sub_token = config.sub_token.expose().clone();
     let ingress_token = config.ingress_token.expose().clone();
-    let state = AppState::new(config, Arc::new(FakeProvider::new())).unwrap();
+    let state = if config.targets.len() == 1 {
+        AppState::new(config, Arc::new(FakeProvider::new())).unwrap()
+    } else {
+        let mut providers = std::collections::HashMap::new();
+        for target in &config.targets {
+            providers.insert(
+                target.id.clone(),
+                Arc::new(FakeProvider::new()) as Arc<dyn IngressProvider>,
+            );
+        }
+        AppState::new_with_providers(config, providers).unwrap()
+    };
     let router = vpn_control::http::router(state.clone());
     TestApp {
         state,
@@ -425,6 +437,101 @@ async fn me_and_status_with_session() {
     assert_eq!(wg["enabled"], false);
     assert!(wg["ingress_public_key"].is_null());
     assert_eq!(wg["ingress_address"], "10.66.0.2/32");
+}
+
+#[tokio::test]
+async fn configured_targets_can_be_listed_and_switched() {
+    let app = app_with(&[(
+        "INGRESS_TARGETS",
+        "tokyo|fake|ap-northeast-1|tokyo;hongkong|fake|ap-east-1|hongkong",
+    )]);
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    let resp = app
+        .get_with_session("/api/ingress/targets", &cookie)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let targets = body_json(resp).await;
+    assert_eq!(targets.as_array().unwrap().len(), 2);
+    assert_eq!(targets[0]["id"], "tokyo");
+    assert_eq!(targets[0]["active"], true);
+    assert_eq!(targets[1]["active"], false);
+
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/switch")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target_id":"hongkong","reason":"test"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    assert_eq!(status["region"], "ap-east-1");
+    assert_eq!(status["instance"], "hongkong");
+
+    let status = body_json(app.get_with_session("/api/status", &cookie).await).await;
+    assert_eq!(status["region"], "ap-east-1");
+    let events = body_json(app.get_with_session("/api/events", &cookie).await).await;
+    assert_eq!(events[0]["action"], "switch");
+    assert_eq!(events[0]["actor"], "alice");
+}
+
+#[tokio::test]
+async fn target_switch_requires_valid_json_admin_and_csrf() {
+    let app = app_with(&[(
+        "INGRESS_TARGETS",
+        "tokyo|fake|ap-northeast-1|tokyo;hongkong|fake|ap-east-1|hongkong",
+    )]);
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+
+    for (content_type, body) in [
+        (None, r#"{"target_id":"hongkong"}"#),
+        (Some("text/plain"), r#"{"target_id":"hongkong"}"#),
+        (Some("application/json"), r#"{"target_id":"hongkong","extra":true}"#),
+        (Some("application/json"), "[]"),
+    ] {
+        let mut builder = request(Method::POST, "/api/ingress/switch")
+            .header(header::COOKIE, session_cookie(&cookie))
+            .header("x-csrf-token", &csrf)
+            .header(header::ORIGIN, BASE);
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .send(builder.body(Body::from(body)).unwrap())
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{content_type:?} {body}");
+    }
+
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/switch")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target_id":"hongkong"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let (user_cookie, user_csrf) = app.login(&["vpn-user"]);
+    let resp = app
+        .send(
+            request(Method::POST, "/api/ingress/switch")
+                .header(header::COOKIE, session_cookie(&user_cookie))
+                .header("x-csrf-token", &user_csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target_id":"hongkong"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

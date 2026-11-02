@@ -1204,6 +1204,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ingress_targets_are_allowlisted_and_unique() {
+        assert_eq!(
+            error_var(&[("INGRESS_TARGETS", "bad.id|fake|local|instance")]),
+            "INGRESS_TARGETS"
+        );
+        assert_eq!(
+            error_var(&[(
+                "INGRESS_TARGETS",
+                "tokyo|fake|local|one;tokyo|fake|local|two",
+            )]),
+            "INGRESS_TARGETS"
+        );
+        assert_eq!(
+            error_var(&[("INGRESS_TARGETS", "ec2|ec2|ap-east-1|not-an-instance")]),
+            "INGRESS_TARGETS"
+        );
+        let c = with(&[(
+            "INGRESS_TARGETS",
+            "tokyo|fake|local|tokyo;hongkong|fake|local|hongkong",
+        )])
+        .unwrap();
+        assert_eq!(
+            c.targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            ["tokyo", "hongkong"]
+        );
+    }
+
+    #[test]
     fn wireguard_settings() {
         assert_eq!(error_var(&[("WG_ENABLED", "true")]), "WG_VPS_ENDPOINT");
         let pubkey = STANDARD.encode([7u8; 32]);

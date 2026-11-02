@@ -106,6 +106,42 @@ describe("ApiClient", () => {
     await expect(api.rotate("x".repeat(201))).rejects.toMatchObject({ code: "bad_request" });
   });
 
+  it("loads configured targets and sends a CSRF-protected switch request", async () => {
+    const f = vi.fn<FetchLike>();
+    f.mockResolvedValueOnce(
+      jsonResponse(200, [
+        { id: "tokyo", provider: "fake", region: "ap-northeast-1", instance: "tokyo", active: true },
+        { id: "hongkong", provider: "fake", region: "ap-east-1", instance: "hongkong", active: false },
+      ]),
+    );
+    f.mockResolvedValueOnce(jsonResponse(200, { ...STATUS, region: "ap-east-1", instance: "hongkong" }));
+    const api = new ApiClient({ fetch: f });
+    api.setCsrfToken("csrf-123");
+
+    const targets = await api.targets();
+    expect(targets[1]?.id).toBe("hongkong");
+    const status = await api.switchTarget("hongkong", "  reachability test  ");
+    expect(status.region).toBe("ap-east-1");
+    expect(f.mock.calls[0]?.[0]).toBe("/api/ingress/targets");
+    expect(f.mock.calls[1]?.[0]).toBe("/api/ingress/switch");
+    expect(f.mock.calls[1]?.[1].body).toBe(
+      JSON.stringify({ target_id: "hongkong", reason: "reachability test" }),
+    );
+    expect((f.mock.calls[1]?.[1].headers as Record<string, string>)["X-CSRF-Token"]).toBe("csrf-123");
+  });
+
+  it("rejects malformed target lists and overlong switch reasons", async () => {
+    const malformed = new ApiClient({
+      fetch: mockFetch(jsonResponse(200, [{ id: "tokyo", active: true }])),
+    });
+    await expect(malformed.targets()).rejects.toMatchObject({ code: "bad_response" });
+
+    const api = new ApiClient({ fetch: mockFetch(jsonResponse(200, {})) });
+    await expect(api.switchTarget("hongkong", "x".repeat(201))).rejects.toMatchObject({
+      code: "bad_request",
+    });
+  });
+
   it("calls onUnauthorized on 401", async () => {
     const onUnauthorized = vi.fn();
     const f = mockFetch(jsonResponse(401, { error: "unauthorized", message: "no" }));
@@ -291,6 +327,15 @@ describe("ApiClient", () => {
       ),
     });
     expect((await api.events())[0]?.action).toBe("settings");
+  });
+
+  it("accepts switch events", async () => {
+    const api = new ApiClient({
+      fetch: mockFetch(
+        jsonResponse(200, [{ at: 1, action: "switch", ip: null, detail: "tokyo -> hongkong", actor: "a" }]),
+      ),
+    });
+    expect((await api.events())[0]?.action).toBe("switch");
   });
 
   it("parses telemetry and log chunks, validates the debug-log request", async () => {

@@ -437,7 +437,7 @@ impl IngressManager {
         target
             .status()
             .await
-            .map_err(|e| ApiError::unavailable(format!("target health check failed: {e:#}")))?;
+            .map_err(|_| ApiError::Unavailable)?;
         let detail = reason
             .filter(|r| !r.trim().is_empty())
             .map(|r| format!("{current} -> {target_id}: {}", sanitize_text(&r, 200)))
@@ -502,6 +502,17 @@ mod tests {
 
     fn ip(last: u8) -> Ipv4Addr {
         Ipv4Addr::new(203, 0, 113, last)
+    }
+
+    fn fake_target(id: &str, region: &str) -> TargetConfig {
+        TargetConfig {
+            id: id.to_string(),
+            provider: crate::config::ProviderConfig {
+                kind: crate::config::ProviderKind::Fake,
+                aws_region: Some(region.to_string()),
+                instance: Some(format!("{id}-instance")),
+            },
+        }
     }
 
     fn orchestrator(
@@ -588,5 +599,115 @@ mod tests {
         assert_eq!(o.stop("b".into()).await.unwrap_err(), ApiError::Conflict);
         first.await.unwrap().unwrap();
         o.stop("b".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manager_switch_persists_target_and_records_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(dir.path()).unwrap());
+        let configs = vec![
+            fake_target("tokyo", "ap-northeast-1"),
+            fake_target("hongkong", "ap-east-1"),
+        ];
+        let mut providers: HashMap<String, Arc<dyn IngressProvider>> = HashMap::new();
+        providers.insert(
+            "tokyo".into(),
+            Arc::new(crate::providers::fake::FakeProvider::new()),
+        );
+        providers.insert(
+            "hongkong".into(),
+            Arc::new(crate::providers::fake::FakeProvider::new()),
+        );
+        let manager = IngressManager::new(
+            &configs,
+            providers,
+            Arc::clone(&store),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        let initial = manager.targets().await;
+        assert_eq!(initial.iter().filter(|target| target.active).count(), 1);
+        assert!(initial
+            .iter()
+            .any(|target| target.id == "tokyo" && target.active));
+
+        let status = manager
+            .switch(
+                "hongkong".into(),
+                "alice".into(),
+                Some("reachability test".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.region, "ap-east-1");
+        assert_eq!(status.instance, "hongkong-instance");
+
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.active_target_id.as_deref(), Some("hongkong"));
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].action, EventAction::Switch);
+        assert_eq!(snapshot.events[0].actor, "alice");
+        assert!(snapshot.events[0].detail.contains("tokyo -> hongkong"));
+
+        let restored = IngressManager::new(
+            &configs,
+            {
+                let mut providers: HashMap<String, Arc<dyn IngressProvider>> = HashMap::new();
+                providers.insert(
+                    "tokyo".into(),
+                    Arc::new(crate::providers::fake::FakeProvider::new()),
+                );
+                providers.insert(
+                    "hongkong".into(),
+                    Arc::new(crate::providers::fake::FakeProvider::new()),
+                );
+                providers
+            },
+            store,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let restored_targets = restored.targets().await;
+        assert!(restored_targets
+            .iter()
+            .any(|target| target.id == "hongkong" && target.active));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_unknown_target_and_conflicts_while_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(dir.path()).unwrap());
+        let configs = vec![fake_target("default", "local")];
+        let provider = Arc::new(Scripted {
+            current: StdMutex::new(ip(1)),
+            next: StdMutex::new(vec![]),
+            delay: Duration::from_millis(300),
+        });
+        let mut providers: HashMap<String, Arc<dyn IngressProvider>> = HashMap::new();
+        providers.insert("default".into(), provider as Arc<dyn IngressProvider>);
+        let manager = Arc::new(
+            IngressManager::new(&configs, providers, store, Duration::ZERO).unwrap(),
+        );
+
+        assert_eq!(
+            manager
+                .switch("missing".into(), "alice".into(), None)
+                .await
+                .unwrap_err(),
+            ApiError::NotFound
+        );
+
+        let running = Arc::clone(&manager);
+        let task = tokio::spawn(async move { running.start("alice".into()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            manager
+                .switch("default".into(), "bob".into(), None)
+                .await
+                .unwrap_err(),
+            ApiError::Conflict
+        );
+        task.await.unwrap().unwrap();
     }
 }
