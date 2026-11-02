@@ -85,8 +85,23 @@ pub struct TargetConfig {
     pub provider: ProviderConfig,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ec2RegionConfig {
+    pub ami_id: String,
+    pub subnet_id: String,
+    pub security_group_ids: Vec<String>,
+}
+#[derive(Debug, Clone)]
+pub struct Ec2LaunchConfig {
+    pub instance_type: String,
+    pub root_volume_gib: i32,
+    pub regions: HashMap<String, Ec2RegionConfig>,
+}
+
 #[derive(Debug)]
 pub struct LifecycleConfig {
+    pub ec2: Ec2LaunchConfig,
     pub enabled: bool,
     pub adopt_existing: bool,
     pub regions: Vec<String>,
@@ -272,7 +287,23 @@ impl Config {
 
         let provider = parse_provider(&env)?;
         let targets = parse_targets(&env, &provider)?;
+        let ec2_regions = match env.opt("EC2_REGION_CONFIG") {
+            Some(raw) => {
+                serde_json::from_str::<HashMap<String, Ec2RegionConfig>>(&raw).map_err(|_| {
+                    err(
+                        "EC2_REGION_CONFIG",
+                        "must be a region-to-launch-settings JSON object",
+                    )
+                })?
+            }
+            None => HashMap::new(),
+        };
         let lifecycle = LifecycleConfig {
+            ec2: Ec2LaunchConfig {
+                instance_type: env.or("EC2_INSTANCE_TYPE", "t3.nano"),
+                root_volume_gib: env.num("EC2_ROOT_VOLUME_GIB", 8i32, 8, 64)?,
+                regions: ec2_regions,
+            },
             enabled: env.boolean("INGRESS_ON_DEMAND", false)?,
             adopt_existing: env.boolean("INGRESS_ADOPT_EXISTING", false)?,
             regions: env
@@ -285,12 +316,13 @@ impl Config {
             reconnect_grace_s: env.num("INGRESS_RECONNECT_GRACE_S", 120i64, 0, 600)?,
         };
         if lifecycle.enabled {
-            if provider.kind != ProviderKind::Lightsail
-                || targets
-                    .iter()
-                    .any(|t| t.provider.kind != ProviderKind::Lightsail)
+            if !matches!(provider.kind, ProviderKind::Lightsail | ProviderKind::Ec2)
+                || targets.iter().any(|t| t.provider.kind != provider.kind)
             {
-                return Err(err("INGRESS_ON_DEMAND", "requires Lightsail providers"));
+                return Err(err(
+                    "INGRESS_ON_DEMAND",
+                    "requires targets matching the selected AWS provider",
+                ));
             }
             let mut seen = std::collections::HashSet::new();
             for region in &lifecycle.regions {
@@ -302,6 +334,56 @@ impl Config {
                     return Err(err(
                         "INGRESS_REGIONS",
                         "use unique Tokyo, Singapore or Hong Kong region codes",
+                    ));
+                }
+            }
+            if provider.kind == ProviderKind::Ec2 {
+                if !matches!(
+                    lifecycle.ec2.instance_type.as_str(),
+                    "t3.nano" | "t3.micro" | "t4g.nano" | "t4g.micro"
+                ) {
+                    return Err(err(
+                        "EC2_INSTANCE_TYPE",
+                        "use t3.nano/micro or t4g.nano/micro",
+                    ));
+                }
+                for region in &lifecycle.regions {
+                    let launch = lifecycle.ec2.regions.get(region).ok_or_else(|| {
+                        err(
+                            "EC2_REGION_CONFIG",
+                            "settings are required for every allowed region",
+                        )
+                    })?;
+                    let valid_id = |id: &str, prefix: &str| {
+                        id.strip_prefix(prefix).is_some_and(|v| {
+                            matches!(v.len(), 8 | 17) && v.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                    };
+                    let mut groups = std::collections::HashSet::new();
+                    if !valid_id(&launch.ami_id, "ami-")
+                        || !valid_id(&launch.subnet_id, "subnet-")
+                        || launch.security_group_ids.is_empty()
+                        || launch.security_group_ids.len() > 5
+                        || launch
+                            .security_group_ids
+                            .iter()
+                            .any(|id| !valid_id(id, "sg-") || !groups.insert(id))
+                    {
+                        return Err(err(
+                            "EC2_REGION_CONFIG",
+                            "invalid AMI, subnet or security group IDs",
+                        ));
+                    }
+                }
+                if lifecycle
+                    .ec2
+                    .regions
+                    .keys()
+                    .any(|r| !lifecycle.regions.contains(r))
+                {
+                    return Err(err(
+                        "EC2_REGION_CONFIG",
+                        "launch settings must only reference allowed regions",
                     ));
                 }
             }
@@ -523,6 +605,13 @@ fn parse_provider<F: Fn(&str) -> Option<String>>(
     // The AWS SDK reads these itself (default credential chain); we only check presence.
     env.req("AWS_ACCESS_KEY_ID")?;
     env.req("AWS_SECRET_ACCESS_KEY")?;
+    if env.boolean("INGRESS_ON_DEMAND", false)? && !env.boolean("INGRESS_ADOPT_EXISTING", false)? {
+        return Ok(ProviderConfig {
+            kind,
+            aws_region: Some(region),
+            instance: None,
+        });
+    }
     let instance = env.req("INGRESS_INSTANCE")?;
     if instance.len() > 255 || !is_visible_ascii(&instance) {
         return Err(err(
@@ -1061,6 +1150,30 @@ pub(crate) mod tests {
             multi.targets[1].provider.aws_region.as_deref(),
             Some("ap-east-1")
         );
+    }
+
+    #[test]
+    fn ec2_on_demand_does_not_require_preexisting_instances() {
+        let settings = r#"{"ap-east-1":{"ami_id":"ami-12345678901234567","subnet_id":"subnet-12345678901234567","security_group_ids":["sg-12345678901234567"]}}"#;
+        let pairs = [
+            ("PROVIDER", "ec2"),
+            ("AWS_REGION", "ap-east-1"),
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "test"),
+            ("INGRESS_ON_DEMAND", "true"),
+            ("INGRESS_REGIONS", "ap-east-1"),
+            ("EC2_REGION_CONFIG", settings),
+        ];
+        let cfg = with(&pairs).unwrap();
+        assert!(cfg.provider.instance.is_none());
+        assert_eq!(cfg.lifecycle.ec2.root_volume_gib, 8);
+        assert!(cfg.lifecycle.ec2.regions.contains_key("ap-east-1"));
+        let mut invalid = pairs.to_vec();
+        invalid.push(("EC2_REGION_CONFIG", "{}"));
+        assert_eq!(with(&invalid).unwrap_err().var, "EC2_REGION_CONFIG");
+        let mut invalid = pairs.to_vec();
+        invalid.push(("EC2_INSTANCE_TYPE", "m7i.48xlarge"));
+        assert_eq!(with(&invalid).unwrap_err().var, "EC2_INSTANCE_TYPE");
     }
 
     #[test]

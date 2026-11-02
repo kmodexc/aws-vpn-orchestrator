@@ -1629,3 +1629,187 @@ async fn lifecycle_requires_admin_and_csrf_and_reports_disabled_mode() {
         assert_eq!(response.status(), expected);
     }
 }
+
+struct OnDemandEc2;
+#[async_trait::async_trait]
+impl vpn_control::lifecycle::Provisioner for OnDemandEc2 {
+    fn provider(&self) -> &'static str {
+        "ec2"
+    }
+    fn plan(&self, region: &str, id: &str) -> anyhow::Result<vpn_control::lifecycle::Deployment> {
+        use vpn_control::lifecycle::{Deployment, DeploymentResources};
+        Ok(Deployment {
+            id: id.into(),
+            region: region.into(),
+            managed: true,
+            public_ip: None,
+            resources: DeploymentResources::Ec2 {
+                instance_id: None,
+                volume_ids: vec![],
+                allocation_id: None,
+                association_id: None,
+                launch: None,
+            },
+        })
+    }
+    async fn ensure(
+        &self,
+        d: &vpn_control::lifecycle::Deployment,
+    ) -> anyhow::Result<vpn_control::lifecycle::Deployment> {
+        let mut result = d.clone();
+        result.public_ip = Some("203.0.113.44".parse()?);
+        if let vpn_control::lifecycle::DeploymentResources::Ec2 { instance_id, .. } =
+            &mut result.resources
+        {
+            *instance_id = Some("i-12345678901234567".into());
+        }
+        Ok(result)
+    }
+    async fn discover(
+        &self,
+        d: &vpn_control::lifecycle::Deployment,
+    ) -> anyhow::Result<vpn_control::lifecycle::Deployment> {
+        Ok(d.clone())
+    }
+    async fn destroy(&self, _: &vpn_control::lifecycle::Deployment) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn status(
+        &self,
+        d: &vpn_control::lifecycle::Deployment,
+    ) -> anyhow::Result<vpn_control::providers::IngressStatus> {
+        Ok(vpn_control::providers::IngressStatus {
+            state: "running".into(),
+            public_ip: d.public_ip,
+        })
+    }
+    async fn reachable(&self, _: &vpn_control::lifecycle::Deployment) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn ec2_on_demand_api_creates_and_deletes_without_preexisting_instance() {
+    let mut app = app_with(&[
+        ("PROVIDER", "ec2"),
+        ("AWS_REGION", "ap-east-1"),
+        ("AWS_ACCESS_KEY_ID", "test"),
+        ("AWS_SECRET_ACCESS_KEY", "test"),
+        ("INGRESS_ON_DEMAND", "true"),
+        ("INGRESS_REGIONS", "ap-east-1"),
+        ("INGRESS_RECONNECT_GRACE_S", "0"),
+        (
+            "EC2_REGION_CONFIG",
+            r#"{"ap-east-1":{"ami_id":"ami-12345678901234567","subnet_id":"subnet-12345678901234567","security_group_ids":["sg-12345678901234567"]}}"#,
+        ),
+    ]);
+    app.router = Router::new(); // Release router clones before installing the provider.
+    app.state = app
+        .state
+        .with_provisioner(Arc::new(OnDemandEc2))
+        .await
+        .unwrap();
+    app.router = vpn_control::http::router(app.state.clone());
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let status = body_json(app.get_with_session("/api/status", &cookie).await).await;
+    assert_eq!(status["state"], "absent");
+    assert_eq!(status["provider"], "ec2");
+    let response = app
+        .send(
+            request(Method::POST, "/api/ingress/lifecycle")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"action":"switch","region":"ap-east-1"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = body_json(response).await;
+    app.state
+        .lifecycle
+        .as_ref()
+        .unwrap()
+        .report_ready(job["id"].as_str().unwrap())
+        .await
+        .unwrap();
+    for _ in 0..1000 {
+        if app
+            .state
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .view()
+            .await
+            .job
+            .as_ref()
+            .is_some_and(|j| j.stage == vpn_control::lifecycle::Stage::Complete)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        app.state
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .view()
+            .await
+            .job
+            .unwrap()
+            .stage,
+        vpn_control::lifecycle::Stage::Complete
+    );
+    let status = body_json(app.get_with_session("/api/status", &cookie).await).await;
+    assert_eq!(status["state"], "running");
+    assert_eq!(status["instance"], "i-12345678901234567");
+    let response = app
+        .send(
+            request(Method::POST, "/api/ingress/lifecycle")
+                .header(header::COOKIE, session_cookie(&cookie))
+                .header("x-csrf-token", &csrf)
+                .header(header::ORIGIN, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"action":"delete"}"#))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    for _ in 0..1000 {
+        if app
+            .state
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .view()
+            .await
+            .job
+            .as_ref()
+            .is_some_and(|j| j.stage == vpn_control::lifecycle::Stage::Complete)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        app.state
+            .lifecycle
+            .as_ref()
+            .unwrap()
+            .view()
+            .await
+            .job
+            .unwrap()
+            .stage,
+        vpn_control::lifecycle::Stage::Complete
+    );
+    let status = body_json(app.get_with_session("/api/status", &cookie).await).await;
+    assert_eq!(status["state"], "absent");
+    assert!(status["public_ip"].is_null());
+    assert_eq!(
+        app.get(&format!("/s/{}", app.sub_token)).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

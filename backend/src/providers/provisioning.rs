@@ -1,4 +1,5 @@
 //! Lightsail reconciliation for a persisted deployment. Never runs shell commands on the host.
+use super::bootstrap::user_data;
 use crate::{
     config::Config,
     lifecycle::{Deployment, Provisioner},
@@ -10,39 +11,11 @@ use aws_sdk_lightsail::{
     Client,
     types::{IpAddressType, PortInfo, Tag},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{collections::HashMap, io::Read, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub struct LightsailProvisioner {
     clients: HashMap<String, Client>,
     config: Arc<Config>,
-}
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-pub fn user_data(config: &Config, deployment: &Deployment) -> anyhow::Result<String> {
-    let mut gzip = flate2::read::GzEncoder::new(
-        include_bytes!("../../../deploy/ingress/bootstrap.sh").as_slice(),
-        flate2::Compression::best(),
-    );
-    let mut compressed = Vec::new();
-    gzip.read_to_end(&mut compressed)?;
-    let payload = STANDARD.encode(compressed);
-    let script = format!(
-        "#!/bin/sh\nset -eu\numask 077\ninstall -d -m 700 /root/vpn-control\nprintf '%s' {} > /etc/vpn-deployment-id\nprintf '%s' '{}' | base64 -d | gunzip > /root/vpn-control/bootstrap.sh\nCONTROL_PLANE_URL={} INGRESS_TOKEN={} VLESS_PORT={} HY2_PORT={} SS_PORT={} SSH_ALLOW_FROM='' bash /root/vpn-control/bootstrap.sh >> /var/log/vpn-control-bootstrap.log 2>&1\n",
-        quote(&deployment.id),
-        payload,
-        quote(&config.public_base_url),
-        quote(config.ingress_token.expose()),
-        config.proxy.vless_port,
-        config.proxy.hy2_port,
-        config.proxy.ss_port
-    );
-    anyhow::ensure!(
-        script.len() <= 16000,
-        "compressed bootstrap exceeds Lightsail user-data limit"
-    );
-    Ok(script)
 }
 impl LightsailProvisioner {
     pub async fn new(config: Arc<Config>) -> Self {
@@ -72,7 +45,7 @@ impl LightsailProvisioner {
         match self
             .client(&d.region)?
             .get_instance()
-            .instance_name(&d.instance)
+            .instance_name(d.instance())
             .send()
             .await
         {
@@ -99,7 +72,7 @@ impl LightsailProvisioner {
         &self,
         d: &Deployment,
     ) -> anyhow::Result<Option<aws_sdk_lightsail::types::StaticIp>> {
-        let Some(name) = &d.static_ip else {
+        let Some(name) = d.static_ip_name() else {
             return Ok(None);
         };
         anyhow::ensure!(
@@ -140,14 +113,18 @@ impl Provisioner for LightsailProvisioner {
             if let Some(ip) = out
                 .static_ips()
                 .iter()
-                .find(|ip| ip.attached_to() == Some(d.instance.as_str()))
+                .find(|ip| ip.attached_to() == Some(d.instance()))
             {
                 let name = ip.name().context("static IP has no name")?;
                 anyhow::ensure!(
                     name.starts_with("vpn-orchestrator-"),
                     "cannot adopt an unmanaged static IP"
                 );
-                result.static_ip = Some(name.into());
+                if let crate::lifecycle::DeploymentResources::Lightsail { static_ip_name, .. } =
+                    &mut result.resources
+                {
+                    *static_ip_name = Some(name.into());
+                }
                 break;
             }
             token = out
@@ -162,7 +139,7 @@ impl Provisioner for LightsailProvisioner {
     }
     async fn ensure(&self, d: &Deployment) -> anyhow::Result<Deployment> {
         anyhow::ensure!(
-            d.managed && d.instance == format!("vpn-ondemand-{}", d.id),
+            d.managed && d.instance() == format!("vpn-ondemand-{}", d.id),
             "invalid generated instance name"
         );
         let client = self.client(&d.region)?;
@@ -187,7 +164,7 @@ impl Provisioner for LightsailProvisioner {
                     .context("no available Lightsail zone")?;
                 client
                     .create_instances()
-                    .instance_names(&d.instance)
+                    .instance_names(d.instance())
                     .availability_zone(zone)
                     .blueprint_id(&self.config.lifecycle.blueprint)
                     .bundle_id(&self.config.lifecycle.bundle)
@@ -233,13 +210,12 @@ impl Provisioner for LightsailProvisioner {
         }
         client
             .put_instance_public_ports()
-            .instance_name(&d.instance)
+            .instance_name(d.instance())
             .set_port_infos(Some(ports))
             .send()
             .await?;
         let name = d
-            .static_ip
-            .as_ref()
+            .static_ip_name()
             .context("missing deterministic static-IP name")?;
         if self.static_ip(d).await?.is_none() {
             client
@@ -254,20 +230,20 @@ impl Provisioner for LightsailProvisioner {
             .context("static IP not visible yet")?;
         if ip.is_attached() == Some(true) {
             anyhow::ensure!(
-                ip.attached_to() == Some(d.instance.as_str()),
+                ip.attached_to() == Some(d.instance()),
                 "static IP belongs to another instance"
             );
         } else {
             client
                 .attach_static_ip()
                 .static_ip_name(name)
-                .instance_name(&d.instance)
+                .instance_name(d.instance())
                 .send()
                 .await?;
         }
         let ip = self.static_ip(d).await?.context("static IP disappeared")?;
         anyhow::ensure!(
-            ip.attached_to() == Some(d.instance.as_str()),
+            ip.attached_to() == Some(d.instance()),
             "waiting for IP attachment"
         );
         let mut result = d.clone();
@@ -280,7 +256,7 @@ impl Provisioner for LightsailProvisioner {
         if self.instance(d).await?.is_some() {
             client
                 .delete_instance()
-                .instance_name(&d.instance)
+                .instance_name(d.instance())
                 .force_delete_add_ons(true)
                 .send()
                 .await?;
@@ -303,7 +279,7 @@ impl Provisioner for LightsailProvisioner {
             );
             client
                 .release_static_ip()
-                .static_ip_name(d.static_ip.as_ref().context("missing static-IP name")?)
+                .static_ip_name(d.static_ip_name().context("missing static-IP name")?)
                 .send()
                 .await?;
             anyhow::ensure!(
@@ -333,26 +309,5 @@ impl Provisioner for LightsailProvisioner {
         )
         .await
         .is_ok_and(|r| r.is_ok()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn embedded_bootstrap_fits_lightsail_and_passes_deployment_identity() {
-        let cfg = Config::from_pairs(crate::config::tests::valid_pairs()).unwrap();
-        let d = Deployment {
-            id: "test-id".into(),
-            region: "ap-east-1".into(),
-            instance: "vpn-ondemand-test-id".into(),
-            static_ip: None,
-            public_ip: None,
-            managed: true,
-        };
-        let script = user_data(&cfg, &d).unwrap();
-        assert!(script.len() <= 16000);
-        assert!(script.contains("'test-id' > /etc/vpn-deployment-id"));
-        assert!(script.starts_with("#!/bin/sh\nset -eu"));
     }
 }

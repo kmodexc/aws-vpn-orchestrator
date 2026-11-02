@@ -34,8 +34,9 @@ export interface Me {
 export interface Deployment {
   id: string;
   region: string;
-  instance: string;
-  static_ip: string | null;
+  resources:
+    | { provider: "lightsail"; instance_name: string; static_ip_name: string | null }
+    | { provider: "ec2"; instance_id: string | null; volume_ids: string[]; allocation_id: string | null; association_id: string | null };
   public_ip: string | null;
   managed: boolean;
 }
@@ -46,6 +47,7 @@ export interface LifecycleJob {
   error: string | null;
 }
 export interface LifecycleView {
+  provider: string;
   enabled: boolean;
   regions: string[];
   active: Deployment | null;
@@ -53,12 +55,17 @@ export interface LifecycleView {
   job: LifecycleJob | null;
 }
 export function parseLifecycle(v: unknown): LifecycleView {
-  if (!isObject(v) || typeof v.enabled !== "boolean" || !Array.isArray(v.regions) ||
+  if (!isObject(v) || !isString(v.provider) || typeof v.enabled !== "boolean" || !Array.isArray(v.regions) ||
       !v.regions.every(isString) || !Array.isArray(v.cleanup_pending)) return bad();
   function deployment(d: unknown): d is Deployment {
-    return isObject(d) && isString(d.id) && isString(d.region) && isString(d.instance) &&
-      (d.static_ip === null || isString(d.static_ip)) && (d.public_ip === null || isString(d.public_ip)) &&
-      typeof d.managed === "boolean";
+    if (!isObject(d) || !isString(d.id) || !isString(d.region) || !isObject(d.resources) ||
+        (d.public_ip !== null && !isString(d.public_ip)) || typeof d.managed !== "boolean") return false;
+    const r = d.resources;
+    if (r.provider === "lightsail") return isString(r.instance_name) && (r.static_ip_name === null || isString(r.static_ip_name));
+    return r.provider === "ec2" && (r.instance_id === null || isString(r.instance_id)) &&
+      Array.isArray(r.volume_ids) && r.volume_ids.every(isString) &&
+      (r.allocation_id === null || isString(r.allocation_id)) &&
+      (r.association_id === null || isString(r.association_id));
   }
   if (v.active !== null && !deployment(v.active)) return bad();
   if (!v.cleanup_pending.every(deployment)) return bad();

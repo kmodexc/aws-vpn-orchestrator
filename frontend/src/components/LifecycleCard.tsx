@@ -47,7 +47,9 @@ export function LifecycleCard({ api, status, statusError, onMode, onChanged }: P
     <p>Active: {view.active ? names[view.active.region] ?? view.active.region : "No server"}</p>
     {view.active && <p className="muted small">{status?.state ?? "Checking state…"} · {status?.public_ip ?? "No public IP"}</p>}
     {statusError && <p className="error" role="alert">{statusError}</p>}
-    <p className="muted small">One server is normally billed. Switching takes several minutes and briefly bills both servers. Stopped Lightsail servers still cost money.</p>
+    <p className="muted small">One server is normally billed. Switching takes several minutes and briefly bills both servers.
+      {view.provider === "ec2" ? " EC2 compute, disk, public IPv4 and applicable traffic are billed separately. Deletion removes the managed server and disks; new servers use automatic public IPs." : " Stopped Lightsail servers still cost money."}
+    </p>
     <div className="field"><label htmlFor="lifecycle-region">Region</label>
       <select id="lifecycle-region" value={selected} onChange={e => { setSelected(e.target.value); }} disabled={busy || pending}>
         {view.regions.map(region => <option key={region} value={region}>{names[region] ?? region}</option>)}

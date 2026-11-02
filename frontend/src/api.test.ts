@@ -442,3 +442,15 @@ describe("on-demand lifecycle", () => {
     await expect(api.lifecycle()).rejects.toBeInstanceOf(ApiError);
   });
 });
+
+it("accepts provider-aware EC2 lifecycle inventory", async () => {
+  const active = {
+    id: "job", region: "ap-east-1", managed: true, public_ip: "203.0.113.1",
+    resources: { provider: "ec2", instance_id: "i-123", volume_ids: ["vol-123"], allocation_id: null, association_id: null },
+  };
+  const api = new ApiClient({ fetch: mockFetch(jsonResponse(200, {
+    enabled: true, provider: "ec2", regions: ["ap-east-1"], active, cleanup_pending: [], job: null,
+  })) });
+  const view = await api.lifecycle();
+  expect(view.provider).toBe("ec2"); expect(view.active?.resources).toEqual(active.resources);
+});

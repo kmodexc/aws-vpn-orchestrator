@@ -1,7 +1,9 @@
 //! Ingress providers (SPEC §6). AWS errors are returned with full detail; callers log them and
 //! surface `unavailable` to clients.
 
+pub mod bootstrap;
 pub mod ec2;
+pub mod ec2_provisioning;
 pub mod fake;
 pub mod lightsail;
 pub mod provisioning;
@@ -101,15 +103,42 @@ async fn build_one(p: &ProviderConfig) -> anyhow::Result<Arc<dyn IngressProvider
 
 /// Build all configured targets. Each AWS SDK client is pinned to the target's region; this is
 /// what lets the control plane switch between already-provisioned regions without restarting.
-pub async fn build_all(
-    cfg: &Config,
-) -> anyhow::Result<HashMap<String, Arc<dyn IngressProvider>>> {
+pub async fn build_all(cfg: &Config) -> anyhow::Result<HashMap<String, Arc<dyn IngressProvider>>> {
     let mut providers = HashMap::with_capacity(cfg.targets.len());
+    if cfg.lifecycle.enabled {
+        for target in &cfg.targets {
+            providers.insert(
+                target.id.clone(),
+                Arc::new(Unprovisioned) as Arc<dyn IngressProvider>,
+            );
+        }
+        return Ok(providers);
+    }
     for target in &cfg.targets {
         let provider = build_one(&target.provider).await?;
         providers.insert(target.id.clone(), provider);
     }
     Ok(providers)
+}
+
+struct Unprovisioned;
+#[async_trait]
+impl IngressProvider for Unprovisioned {
+    async fn status(&self) -> anyhow::Result<IngressStatus> {
+        Ok(IngressStatus {
+            state: "absent".into(),
+            public_ip: None,
+        })
+    }
+    async fn start(&self) -> anyhow::Result<()> {
+        anyhow::bail!("use lifecycle controls")
+    }
+    async fn stop(&self) -> anyhow::Result<()> {
+        anyhow::bail!("use lifecycle controls")
+    }
+    async fn rotate_ip(&self) -> anyhow::Result<Ipv4Addr> {
+        anyhow::bail!("use lifecycle controls")
+    }
 }
 
 #[cfg(test)]

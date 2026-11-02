@@ -11,16 +11,115 @@ use serde::{Deserialize, Serialize};
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Deployment {
     pub id: String,
     pub region: String,
-    pub instance: String,
-    pub static_ip: Option<String>,
+    pub resources: DeploymentResources,
     pub public_ip: Option<Ipv4Addr>,
-    /// Only generated deployments may be removed automatically. Existing deployments require
-    /// an explicit adoption setting and are discovered before their resource names are saved.
     pub managed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum DeploymentResources {
+    Lightsail {
+        instance_name: String,
+        static_ip_name: Option<String>,
+    },
+    Ec2 {
+        instance_id: Option<String>,
+        volume_ids: Vec<String>,
+        allocation_id: Option<String>,
+        association_id: Option<String>,
+        launch: Option<Ec2LaunchSpec>,
+    },
+}
+
+/// Nonsecret parameters are frozen before RunInstances. The bootstrap hash prevents replay
+/// with different user data after a configuration/image update (client-token mismatch).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ec2LaunchSpec {
+    pub ami_id: String,
+    pub subnet_id: String,
+    pub security_group_ids: Vec<String>,
+    pub instance_type: String,
+    pub root_volume_gib: i32,
+    pub user_data_sha256: String,
+}
+
+impl Deployment {
+    pub fn instance(&self) -> &str {
+        match &self.resources {
+            DeploymentResources::Lightsail { instance_name, .. } => instance_name,
+            DeploymentResources::Ec2 { instance_id, .. } => instance_id.as_deref().unwrap_or(""),
+        }
+    }
+    pub fn static_ip_name(&self) -> Option<&str> {
+        match &self.resources {
+            DeploymentResources::Lightsail { static_ip_name, .. } => static_ip_name.as_deref(),
+            _ => None,
+        }
+    }
+    pub fn provider(&self) -> &'static str {
+        match self.resources {
+            DeploymentResources::Lightsail { .. } => "lightsail",
+            DeploymentResources::Ec2 { .. } => "ec2",
+        }
+    }
+    pub fn lightsail(
+        id: String,
+        region: String,
+        instance_name: String,
+        static_ip_name: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            region,
+            resources: DeploymentResources::Lightsail {
+                instance_name,
+                static_ip_name,
+            },
+            public_ip: None,
+            managed: true,
+        }
+    }
+}
+
+// Explicit compatibility with the original untagged Lightsail state. Never reinterpret it as EC2.
+impl<'de> Deserialize<'de> for Deployment {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Stored {
+            id: String,
+            region: String,
+            public_ip: Option<Ipv4Addr>,
+            managed: bool,
+            resources: Option<DeploymentResources>,
+            instance: Option<String>,
+            static_ip: Option<String>,
+        }
+        let value = Stored::deserialize(deserializer)?;
+        let resources = match (value.resources, value.instance) {
+            (Some(resources), None) => resources,
+            (None, Some(instance_name)) => DeploymentResources::Lightsail {
+                instance_name,
+                static_ip_name: value.static_ip,
+            },
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "invalid deployment resource inventory",
+                ));
+            }
+        };
+        Ok(Self {
+            id: value.id,
+            region: value.region,
+            resources,
+            public_ip: value.public_ip,
+            managed: value.managed,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +157,7 @@ pub struct LifecycleState {
 }
 #[derive(Debug, Serialize)]
 pub struct View {
+    pub provider: String,
     pub enabled: bool,
     pub regions: Vec<String>,
     pub active: Option<Deployment>,
@@ -67,6 +167,17 @@ pub struct View {
 
 #[async_trait]
 pub trait Provisioner: Send + Sync {
+    fn provider(&self) -> &'static str {
+        "lightsail"
+    }
+    fn plan(&self, region: &str, id: &str) -> anyhow::Result<Deployment> {
+        Ok(Deployment::lightsail(
+            id.into(),
+            region.into(),
+            format!("vpn-ondemand-{id}"),
+            Some(format!("vpn-orchestrator-{id}")),
+        ))
+    }
     /// Reconcile deterministic names. A retry must not create another instance or static IP.
     async fn ensure(&self, deployment: &Deployment) -> anyhow::Result<Deployment>;
     async fn discover(&self, deployment: &Deployment) -> anyhow::Result<Deployment>;
@@ -98,7 +209,23 @@ impl Lifecycle {
         }
     }
     pub async fn initialize(&self, cfg: &Config) -> anyhow::Result<()> {
-        if self.store.snapshot().await.lifecycle.is_some() {
+        if let Some(state) = self.store.snapshot().await.lifecycle {
+            let expected = cfg.provider.kind.as_str();
+            let deployments = state
+                .active
+                .iter()
+                .chain(state.cleanup_pending.iter())
+                .chain(
+                    state
+                        .job
+                        .iter()
+                        .filter(|j| j.unfinished())
+                        .filter_map(|j| j.candidate.as_ref()),
+                );
+            anyhow::ensure!(
+                deployments.into_iter().all(|d| d.provider() == expected),
+                "persisted lifecycle resources use another provider; reconcile those resources before changing PROVIDER"
+            );
             return Ok(());
         }
         // Adoption is explicit: never silently treat all configured targets as disposable.
@@ -119,17 +246,26 @@ impl Lifecycle {
                 self.regions.contains(&region),
                 "existing region is not allowed for lifecycle"
             );
-            let deployment = Deployment {
-                id: "adopted".into(),
-                region,
-                instance: target
-                    .provider
-                    .instance
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("missing adoption instance"))?,
-                static_ip: None,
-                public_ip: None,
-                managed: true,
+            let instance = target
+                .provider
+                .instance
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing adoption instance"))?;
+            let deployment = match cfg.provider.kind {
+                crate::config::ProviderKind::Ec2 => Deployment {
+                    id: "adopted".into(),
+                    region,
+                    public_ip: None,
+                    managed: true,
+                    resources: DeploymentResources::Ec2 {
+                        instance_id: Some(instance),
+                        volume_ids: vec![],
+                        allocation_id: None,
+                        association_id: None,
+                        launch: None,
+                    },
+                },
+                _ => Deployment::lightsail("adopted".into(), region, instance, None),
             };
             Some(self.cloud.discover(&deployment).await?)
         } else {
@@ -147,6 +283,7 @@ impl Lifecycle {
     pub async fn view(&self) -> View {
         let state = self.store.snapshot().await.lifecycle.unwrap_or_default();
         View {
+            provider: self.cloud.provider().into(),
             enabled: true,
             regions: self.regions.clone(),
             active: state.active,
@@ -179,14 +316,10 @@ impl Lifecycle {
             }
         }
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let candidate = region.map(|region| Deployment {
-            id: id.clone(),
-            region,
-            instance: format!("vpn-ondemand-{id}"),
-            static_ip: Some(format!("vpn-orchestrator-{id}")),
-            public_ip: None,
-            managed: true,
-        });
+        let candidate = region
+            .map(|region| self.cloud.plan(&region, &id))
+            .transpose()
+            .map_err(|e| ApiError::unavailable(e.to_string()))?;
         let job = Job {
             id,
             stage: if candidate.is_some() {
@@ -450,14 +583,12 @@ mod tests {
         }
     }
     fn deployment(id: &str) -> Deployment {
-        Deployment {
-            id: id.into(),
-            region: "ap-east-1".into(),
-            instance: format!("vpn-ondemand-{id}"),
-            static_ip: Some(format!("vpn-orchestrator-{id}")),
-            public_ip: None,
-            managed: true,
-        }
+        Deployment::lightsail(
+            id.into(),
+            "ap-east-1".into(),
+            format!("vpn-ondemand-{id}"),
+            Some(format!("vpn-orchestrator-{id}")),
+        )
     }
     fn job(stage: Stage) -> Job {
         Job {
@@ -484,6 +615,18 @@ mod tests {
             .await
             .unwrap();
     }
+    #[test]
+    fn legacy_lightsail_inventory_migrates_without_reinterpreting_ownership() {
+        let legacy = r#"{"id":"old","region":"ap-east-1","instance":"vpn-ingress","static_ip":"vpn-orchestrator-old","public_ip":null,"managed":true}"#;
+        let deployment: Deployment = serde_json::from_str(legacy).unwrap();
+        assert_eq!(deployment.provider(), "lightsail");
+        assert_eq!(deployment.instance(), "vpn-ingress");
+        assert_eq!(deployment.static_ip_name(), Some("vpn-orchestrator-old"));
+        let restored: Deployment =
+            serde_json::from_str(&serde_json::to_string(&deployment).unwrap()).unwrap();
+        assert_eq!(restored, deployment);
+    }
+
     #[tokio::test]
     async fn absent_ingress_has_no_stale_subscription_ip() {
         let dir = tempfile::tempdir().unwrap();

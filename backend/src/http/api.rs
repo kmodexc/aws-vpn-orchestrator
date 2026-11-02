@@ -52,7 +52,7 @@ pub async fn status(State(state): State<AppState>, _p: Admin) -> Result<Response
         let view = lifecycle.view().await;
         let status = state.ingress_status().await?;
         return Ok(Json(crate::orchestrator::StatusView {
-            provider: "lightsail".into(),
+            provider: state.config.provider.kind.as_str().into(),
             region: view
                 .active
                 .as_ref()
@@ -61,7 +61,7 @@ pub async fn status(State(state): State<AppState>, _p: Admin) -> Result<Response
             instance: view
                 .active
                 .as_ref()
-                .map(|d| d.instance.clone())
+                .map(|d| d.instance().to_string())
                 .unwrap_or_default(),
             state: status.state,
             public_ip: status.public_ip.map(|ip| ip.to_string()),
@@ -594,7 +594,7 @@ fn reject_legacy_lifecycle(state: &AppState) -> Result<(), ApiError> {
 pub async fn lifecycle_view(State(state): State<AppState>, _p: Admin) -> Response {
     match &state.lifecycle {
         Some(lifecycle) => Json(lifecycle.view().await).into_response(),
-        None => Json(json!({"enabled": false, "regions": [], "active": null, "cleanup_pending": [], "job": null})).into_response(),
+        None => Json(json!({"provider": state.config.provider.kind.as_str(), "enabled": false, "regions": [], "active": null, "cleanup_pending": [], "job": null})).into_response(),
     }
 }
 #[derive(Default, Deserialize)]

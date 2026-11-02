@@ -197,7 +197,7 @@ Two companion scripts:
 | [deploy/aws/rebuild-lightsail.sh](deploy/aws/rebuild-lightsail.sh) `--region ap-southeast-1` | Rotating the IP is not enough (whole range blocked): builds a fresh ingress in another region, re-pins the IAM policy, updates `.env`, deletes the old instance and its static IPs. Same secrets, so clients only need a subscription update. Then `docker compose up -d --force-recreate app`. |
 | [deploy/aws/teardown-lightsail.sh](deploy/aws/teardown-lightsail.sh) | Back home: deletes the instance, its static IPs, the IAM user (`--keep-iam` to keep it) and optionally the budget (`--budget`); clears the AWS key in `.env`. |
 
-EC2 is supported by the backend (`PROVIDER=ec2`) but has no setup script — use the manual steps
+EC2 legacy existing-instance control is supported (`PROVIDER=ec2`); use the manual steps
 below and [deploy/iam/ec2.json](deploy/iam/ec2.json).
 
 #### Manual alternative: the ingress instance
@@ -529,11 +529,80 @@ Report security issues privately to the maintainer, not via public issues.
 
 ### On-demand regions: keep one billed ingress
 
-The optional on-demand mode creates a replacement Lightsail ingress when you select a region
+The optional on-demand mode supports EC2 and Lightsail. It creates a replacement ingress when you select a region
 from the phone dashboard, verifies its bootstrap report and TCP proxy listener, makes it active,
-and deletes the old instance and its static IP after a reconnect window. Closing your browser
+and deletes the old deployment after a reconnect window. EC2 also verifies disk cleanup; Lightsail releases its static IP. Closing your browser
 does not cancel the job. Jobs and cleanup inventory survive backend restarts in `/data/state.json`.
 The control-plane host must remain online; its hosting costs are separate.
+
+#### EC2 on-demand setup
+
+This mode creates/deletes EC2 instances; it does not keep stopped regional standbys. Each new
+server receives an automatic public IPv4 address, with an encrypted gp3 root disk that is deleted
+on termination. T3/T4g CPU credits are set to standard to avoid surplus-credit charges. Compute,
+disk, IPv4 and applicable traffic are separately billed while resources exist. No Elastic IP,
+NAT gateway, snapshot or load balancer is created by the app.
+
+1. Prepare a public subnet and security group in each selected region using your admin identity.
+   The subnet must have a direct default route through an internet gateway; the groups must
+   belong to that subnet's VPC and allow exactly the configured proxy ports from `0.0.0.0/0`
+   (default TCP 443, UDP 443, TCP/UDP 8443). No SSH rule is needed. Ensure outbound HTTPS/DNS
+   and package downloads work. The runtime identity cannot create or alter these networks.
+2. Choose an available Canonical Ubuntu 24.04 server AMI per region. Canonical's owner account
+   is `099720109477`. Use amd64 with `t3.nano`/`t3.micro`, arm64 with `t4g.nano`/`t4g.micro`.
+   For example, this read-only command lists the latest amd64 image in Hong Kong:
+
+   ```bash
+   aws ec2 describe-images --profile default --region ap-east-1 --owners 099720109477 \
+     --filters 'Name=name,Values=ubuntu/images/*/ubuntu-noble-24.04-amd64-server-*' \
+       'Name=state,Values=available' \
+     --query 'sort_by(Images,&CreationDate)[-1].{AMI:ImageId,Root:RootDeviceName}'
+   ```
+
+3. Grant provisioning permissions to the dedicated app user:
+
+   ```bash
+   bash deploy/aws/configure-ec2-iam.sh --profile default --iam-user vpn-control
+   ```
+
+   This adds `deploy/iam/ec2-provisioning.json` as a customer-managed policy. It allows small
+   tagged instances and encrypted disks in the three allowed regions, and cleanup of tagged
+   resources. It grants no IAM administration. Review/remove obsolete Lightsail grants separately.
+4. Update the app host's `.env` (example IDs below must be replaced):
+
+   ```dotenv
+   PROVIDER=ec2
+   AWS_REGION=ap-east-1
+   INGRESS_ON_DEMAND=true
+   INGRESS_ADOPT_EXISTING=false
+   INGRESS_REGIONS=ap-northeast-1,ap-southeast-1,ap-east-1
+   EC2_INSTANCE_TYPE=t3.nano
+   EC2_ROOT_VOLUME_GIB=8
+   EC2_REGION_CONFIG={"ap-northeast-1":{"ami_id":"ami-REPLACE","subnet_id":"subnet-REPLACE","security_group_ids":["sg-REPLACE"]},"ap-southeast-1":{"ami_id":"ami-REPLACE","subnet_id":"subnet-REPLACE","security_group_ids":["sg-REPLACE"]},"ap-east-1":{"ami_id":"ami-REPLACE","subnet_id":"subnet-REPLACE","security_group_ids":["sg-REPLACE"]}}
+   ```
+
+   Keep the dedicated AWS key. Remove legacy `INGRESS_TARGETS`; no pre-existing
+   `INGRESS_INSTANCE` is required in this mode. Regions missing launch settings are rejected.
+   You can initially enable just one region by shortening `INGRESS_REGIONS` and its JSON map.
+5. Build/deploy this version with `docker compose build app`, then
+   `docker compose up -d --no-build --force-recreate app`. Start a server from your phone.
+   On switching, refresh the VPN client subscription during the reconnect window.
+
+EC2 launch parameters are saved before contacting AWS. A deployment-specific client token and
+frozen subnet/AMI/type/disk settings prevent duplicate launches when a response is lost. A
+bootstrap fingerprint prevents replay with altered secrets or bootstrap code. Changing these
+settings during an unfinished job may require cleaning that candidate and submitting a new job.
+Cleanup discovers instance/disk/IP resources by deployment tags even if their IDs were never
+acknowledged. Foreign or still-attached resources are not deleted; failures retain the inventory
+and show **Retry cleanup**. Do not edit deployment tags outside the app.
+
+Old Lightsail inventory is read explicitly as Lightsail, never as EC2. Changing `PROVIDER` while
+state still owns resources from another provider stops startup. Reconcile that inventory before
+migration; do not delete the whole state file to bypass the check. Existing unmanaged cloud
+resources are not automatically removed. EC2 adoption is limited to already-managed instances
+with a valid `vpn-deployment` tag and owned disks/IPs; a clean start is preferred after teardown.
+
+#### Lightsail on-demand setup
 
 To enable on an existing installation:
 

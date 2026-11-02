@@ -1,0 +1,193 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadAllowedRegions",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeRouteTables"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": [
+            "ap-northeast-1",
+            "ap-southeast-1",
+            "ap-east-1"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "UbuntuImages",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1::image/*",
+        "arn:aws:ec2:ap-southeast-1::image/*",
+        "arn:aws:ec2:ap-east-1::image/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:Owner": "099720109477"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchNetworking",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:subnet/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:subnet/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:subnet/*",
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:security-group/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:security-group/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:security-group/*",
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:network-interface/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:network-interface/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:network-interface/*"
+      ]
+    },
+    {
+      "Sid": "SmallTaggedInstances",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:instance/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/vpn-orchestrator": "managed",
+          "ec2:InstanceType": [
+            "t3.nano",
+            "t3.micro",
+            "t4g.nano",
+            "t4g.micro"
+          ],
+          "ec2:MetadataHttpTokens": "required"
+        },
+        "StringLike": {
+          "aws:RequestTag/vpn-deployment": "????????????????????????????????"
+        }
+      }
+    },
+    {
+      "Sid": "EncryptedTaggedRootDisks",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/vpn-orchestrator": "managed",
+          "ec2:VolumeType": "gp3"
+        },
+        "StringLike": {
+          "aws:RequestTag/vpn-deployment": "????????????????????????????????"
+        },
+        "Bool": {
+          "ec2:Encrypted": "true"
+        },
+        "NumericLessThanEquals": {
+          "ec2:VolumeSize": "64"
+        }
+      }
+    },
+    {
+      "Sid": "TagsOnlyAtLaunch",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": "RunInstances",
+          "aws:RequestTag/vpn-orchestrator": "managed"
+        },
+        "StringLike": {
+          "aws:RequestTag/vpn-deployment": "????????????????????????????????"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "Name",
+            "vpn-orchestrator",
+            "vpn-deployment"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "TerminateManagedInstances",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:instance/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:instance/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/vpn-orchestrator": "managed"
+        },
+        "Null": {
+          "aws:ResourceTag/vpn-deployment": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DeleteManagedDisks",
+      "Effect": "Allow",
+      "Action": "ec2:DeleteVolume",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:volume/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/vpn-orchestrator": "managed"
+        },
+        "Null": {
+          "aws:ResourceTag/vpn-deployment": "false"
+        }
+      }
+    },
+    {
+      "Sid": "ReleaseManagedReservedIps",
+      "Effect": "Allow",
+      "Action": "ec2:ReleaseAddress",
+      "Resource": [
+        "arn:aws:ec2:ap-northeast-1:<ACCOUNT_ID>:elastic-ip/*",
+        "arn:aws:ec2:ap-southeast-1:<ACCOUNT_ID>:elastic-ip/*",
+        "arn:aws:ec2:ap-east-1:<ACCOUNT_ID>:elastic-ip/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/vpn-orchestrator": "managed"
+        },
+        "Null": {
+          "aws:ResourceTag/vpn-deployment": "false"
+        }
+      }
+    }
+  ]
+}

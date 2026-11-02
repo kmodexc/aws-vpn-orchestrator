@@ -101,6 +101,27 @@ impl AppState {
         })))
     }
 
+    /// Install a lifecycle backend before sharing application state. Also supports network-free
+    /// integration tests with the same startup/recovery path as production.
+    pub async fn with_provisioner(
+        mut self,
+        cloud: Arc<dyn crate::lifecycle::Provisioner>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(self.config.lifecycle.enabled, "on-demand mode is disabled");
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new(
+            self.orchestrator.shared_store(),
+            cloud,
+            self.config.lifecycle.regions.clone(),
+            self.config.lifecycle.reconnect_grace_s,
+        ));
+        lifecycle.initialize(&self.config).await?;
+        Arc::get_mut(&mut self.0)
+            .ok_or_else(|| anyhow::anyhow!("application state already shared"))?
+            .lifecycle = Some(Arc::clone(&lifecycle));
+        lifecycle.wake();
+        Ok(self)
+    }
+
     pub async fn ingress_status(
         &self,
     ) -> Result<crate::providers::IngressStatus, crate::error::ApiError> {
@@ -189,21 +210,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let providers = providers::build_all(&config).await?;
     let mut state = AppState::new_with_providers(config, providers)?;
     if state.config.lifecycle.enabled {
-        let cloud = Arc::new(
-            crate::providers::provisioning::LightsailProvisioner::new(Arc::clone(&state.config))
+        let cloud: Arc<dyn crate::lifecycle::Provisioner> = match state.config.provider.kind {
+            crate::config::ProviderKind::Ec2 => Arc::new(
+                crate::providers::ec2_provisioning::Ec2Provisioner::new(Arc::clone(&state.config))
+                    .await,
+            ),
+            crate::config::ProviderKind::Lightsail => Arc::new(
+                crate::providers::provisioning::LightsailProvisioner::new(Arc::clone(
+                    &state.config,
+                ))
                 .await,
-        );
-        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new(
-            state.orchestrator.shared_store(),
-            cloud,
-            state.config.lifecycle.regions.clone(),
-            state.config.lifecycle.reconnect_grace_s,
-        ));
-        lifecycle.initialize(&state.config).await?;
-        Arc::get_mut(&mut state.0)
-            .ok_or_else(|| anyhow::anyhow!("application state already shared"))?
-            .lifecycle = Some(Arc::clone(&lifecycle));
-        lifecycle.wake();
+            ),
+            _ => anyhow::bail!("on-demand mode requires an AWS provider"),
+        };
+        state = state.with_provisioner(cloud).await?;
     }
     let app = crate::http::router(state.clone());
 

@@ -436,3 +436,28 @@ the persisted reconnect deadline. Default reconnect grace is 120 seconds (config
 Jobs periodically resume after transient state-write errors; failed persistence never permits
 advancing to a destructive transition. Old snapshots and unrelated legacy servers are outside
 this lifecycle's scope and may still incur charges.
+
+
+### EC2 lifecycle extension
+
+`PROVIDER=ec2` now uses the same lifecycle endpoints and stages. Deployment inventory has a
+`resources` object discriminated by `provider`: Lightsail names or EC2 instance/volume/IP IDs
+and a frozen nonsecret launch specification. Original flat Lightsail records are migrated on
+read. A configured provider mismatch with owned state fails startup; completed job history is
+not treated as live inventory.
+
+EC2 plans require `EC2_REGION_CONFIG` settings for each allowlisted region, `EC2_INSTANCE_TYPE`
+(t3.nano/micro or t4g.nano/micro) and `EC2_ROOT_VOLUME_GIB` (8–64). No existing instance is
+required when adoption is off. AMIs must be available Canonical Ubuntu 24.04 EBS images with
+architecture matching the type. Subnets and security groups are prepared by the operator;
+preflight requires matching VPCs, the configured VPN-only ingress rules, and a public internet
+gateway route. Launches use one instance, a deterministic client token, standard CPU credits,
+IMDSv2, an encrypted gp3 root disk and delete-on-termination disk/network flags. Automatic
+public IPv4 is used; no Elastic IP is allocated. Each created instance and volume is tagged
+with ownership and the deployment ID.
+
+The lifecycle response includes `provider`. EC2 cleanup waits for termination and confirms
+owned disks and reserved IPs are gone. Pending/foreign/attached resources retain inventory and
+are reported as cleanup failures. Mutations require the original deployment ownership tags.
+No snapshots, private networking, managed NAT gateways, standby pool or automatic image lookup
+are provisioned by this feature.
