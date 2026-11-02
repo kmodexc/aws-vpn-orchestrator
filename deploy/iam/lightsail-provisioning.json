@@ -1,0 +1,35 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadAndAllocateInAllowedRegions",
+      "Effect": "Allow",
+      "Action": ["lightsail:GetInstance", "lightsail:GetStaticIp", "lightsail:GetStaticIps", "lightsail:GetRegions", "lightsail:AllocateStaticIp"],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"aws:RequestedRegion": ["ap-northeast-1", "ap-southeast-1", "ap-east-1"]}}
+    },
+    {
+      "Sid": "CreateOnlyManagedInstances",
+      "Effect": "Allow",
+      "Action": "lightsail:CreateInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {"aws:RequestedRegion": ["ap-northeast-1", "ap-southeast-1", "ap-east-1"], "aws:RequestTag/vpn-orchestrator": "managed"},
+        "ForAllValues:StringEquals": {"aws:TagKeys": ["vpn-orchestrator"]}
+      }
+    },
+    {
+      "Sid": "ManageTaggedInstances",
+      "Effect": "Allow",
+      "Action": ["lightsail:DeleteInstance", "lightsail:PutInstancePublicPorts", "lightsail:AttachStaticIp"],
+      "Resource": ["arn:aws:lightsail:ap-northeast-1:<ACCOUNT_ID>:Instance/*", "arn:aws:lightsail:ap-southeast-1:<ACCOUNT_ID>:Instance/*", "arn:aws:lightsail:ap-east-1:<ACCOUNT_ID>:Instance/*"],
+      "Condition": {"StringEquals": {"aws:ResourceTag/vpn-orchestrator": "managed"}}
+    },
+    {
+      "Sid": "StaticIpsInAllowedRegions",
+      "Effect": "Allow",
+      "Action": ["lightsail:AttachStaticIp", "lightsail:ReleaseStaticIp"],
+      "Resource": ["arn:aws:lightsail:ap-northeast-1:<ACCOUNT_ID>:StaticIp/*", "arn:aws:lightsail:ap-southeast-1:<ACCOUNT_ID>:StaticIp/*", "arn:aws:lightsail:ap-east-1:<ACCOUNT_ID>:StaticIp/*"]
+    }
+  ]
+}

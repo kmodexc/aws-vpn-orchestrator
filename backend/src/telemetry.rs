@@ -25,6 +25,8 @@ pub const LOG_RETENTION_AFTER_DEBUG_S: i64 = 3600;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngressReport {
+    #[serde(default)]
+    pub deployment_id: Option<String>,
     /// sing-box version string, e.g. "1.14.4".
     pub version: String,
     /// Seconds since sing-box started; `None` when it is not running.
@@ -352,6 +354,7 @@ mod tests {
 
     fn report(up: Option<u64>, down: Option<u64>, log: Vec<String>) -> IngressReport {
         IngressReport {
+            deployment_id: None,
             version: "1.14.4".into(),
             uptime_s: Some(10),
             connections: Some(2),

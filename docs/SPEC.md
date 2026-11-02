@@ -416,3 +416,23 @@ React 18+ with TypeScript (strict) and Vite, no UI framework required. Plain CSS
   `Referrer-Policy: no-referrer` (§10), a non-`cors` POST would otherwise carry `Origin: null` and
   fail the CSRF Origin check (§4.4). Navigations keep `no-referrer`.
 - On 401 after the first load (session expired), go back to the login screen.
+
+## Optional on-demand Lightsail lifecycle
+
+When `INGRESS_ON_DEMAND=true`, `/api/ingress/lifecycle` provides authenticated, admin-only
+lifecycle state (GET) and CSRF-protected operations (POST). POST accepts exactly an `action`
+(`switch`, `delete`, `retry_cleanup`) and optional `region` (required only for switch); successful
+submissions return 202. Regions are configuration allowlisted. Existing start/stop/rotate/switch
+routes reject requests in this mode. Legacy behavior remains unchanged when disabled.
+
+The durable job stages are creating, waiting_ready, reconnect, cleaning, failed and complete.
+Readiness requires a report carrying the candidate's deployment ID, a current config hash,
+a running sing-box process with available stats, and an externally reachable TCP proxy port.
+Activation is persisted before old-resource deletion. Provisioning retries reconcile stable
+resource names for up to 15 minutes; overall readiness times out after 20 minutes. A failed
+replacement is cleaned while the original active deployment remains selected. Cleanup failures
+retain exact inventory and require explicit retry. On restart, unfinished jobs resume, including
+the persisted reconnect deadline. Default reconnect grace is 120 seconds (configurable 0–600).
+Jobs periodically resume after transient state-write errors; failed persistence never permits
+advancing to a destructive transition. Old snapshots and unrelated legacy servers are outside
+this lifecycle's scope and may still incur charges.

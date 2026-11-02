@@ -21,6 +21,7 @@
 #   --profile NAME        AWS CLI profile with admin rights (default: your default credentials)
 #   --region REGION       default: AWS_REGION from .env, else ap-northeast-1 (Tokyo)
 #   --name NAME           instance name (default: INGRESS_INSTANCE from .env, else vpn-ingress)
+#   --add-target ID       add a switchable target; preserve primary settings and existing policies
 #   --bundle ID           Lightsail bundle (default: cheapest active Linux bundle with IPv4)
 #   --blueprint ID        default: ubuntu_24_04
 #   --az ZONE             availability zone (default: first available)
@@ -56,18 +57,26 @@ if [[ -z ${NAME} ]]; then
 fi
 validate_region "${REGION}"
 validate_instance_name "${NAME}"
+if [[ -n ${ADD_TARGET} ]]; then
+  prepare_added_target "${ADD_TARGET}" "${REGION}" "${NAME}"
+fi
 
 resolve_account
 resolve_ssh_cidr
 
 log "ingress: ${NAME} in ${REGION}; control plane: ${CONTROL_PLANE_URL}"
 provision_ingress "${REGION}" "${NAME}" "${BUNDLE}" "${BLUEPRINT}" "${AZ}" "${SSH_CIDR}"
-ensure_iam "${REGION}" "${NAME}"
+ensure_iam "${REGION}" "${NAME}" "${ADD_TARGET:+${POLICY_NAME}-${ADD_TARGET}}"
 
-env_set PROVIDER lightsail
-env_set AWS_REGION "${REGION}"
-env_set INGRESS_INSTANCE "${NAME}"
-log "updated ${ENV_FILE}: PROVIDER, AWS_REGION, INGRESS_INSTANCE, AWS_ACCESS_KEY_ID/SECRET"
+if [[ -n ${ADD_TARGET} ]]; then
+  env_set INGRESS_TARGETS "${UPDATED_TARGETS}"
+  log "registered target ${ADD_TARGET}; primary settings preserved"
+else
+  env_set PROVIDER lightsail
+  env_set AWS_REGION "${REGION}"
+  env_set INGRESS_INSTANCE "${NAME}"
+  log "updated ${ENV_FILE}: PROVIDER, AWS_REGION, INGRESS_INSTANCE, AWS_ACCESS_KEY_ID/SECRET"
+fi
 
 if [[ -n ${BUDGET_EMAIL} ]]; then
   ensure_budget "${BUDGET_EMAIL}" "${BUDGET_USD}"

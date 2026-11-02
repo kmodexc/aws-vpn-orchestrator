@@ -86,6 +86,16 @@ pub struct TargetConfig {
 }
 
 #[derive(Debug)]
+pub struct LifecycleConfig {
+    pub enabled: bool,
+    pub adopt_existing: bool,
+    pub regions: Vec<String>,
+    pub bundle: String,
+    pub blueprint: String,
+    pub reconnect_grace_s: i64,
+}
+
+#[derive(Debug)]
 pub struct ProxyConfig {
     pub reality_sni: String,
     pub hy2_sni: String,
@@ -143,6 +153,7 @@ pub struct Config {
     pub session_absolute_timeout: Duration,
     pub provider: ProviderConfig,
     pub targets: Vec<TargetConfig>,
+    pub lifecycle: LifecycleConfig,
     pub rotate_cooldown: Duration,
     pub sub_token: Secret<String>,
     pub ingress_token: Secret<String>,
@@ -261,6 +272,46 @@ impl Config {
 
         let provider = parse_provider(&env)?;
         let targets = parse_targets(&env, &provider)?;
+        let lifecycle = LifecycleConfig {
+            enabled: env.boolean("INGRESS_ON_DEMAND", false)?,
+            adopt_existing: env.boolean("INGRESS_ADOPT_EXISTING", false)?,
+            regions: env
+                .or("INGRESS_REGIONS", "ap-northeast-1,ap-southeast-1,ap-east-1")
+                .split(',')
+                .map(|r| r.trim().to_string())
+                .collect(),
+            bundle: env.or("INGRESS_BUNDLE", "nano_3_0"),
+            blueprint: env.or("INGRESS_BLUEPRINT", "ubuntu_24_04"),
+            reconnect_grace_s: env.num("INGRESS_RECONNECT_GRACE_S", 120i64, 0, 600)?,
+        };
+        if lifecycle.enabled {
+            if provider.kind != ProviderKind::Lightsail
+                || targets
+                    .iter()
+                    .any(|t| t.provider.kind != ProviderKind::Lightsail)
+            {
+                return Err(err("INGRESS_ON_DEMAND", "requires Lightsail providers"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for region in &lifecycle.regions {
+                if !matches!(
+                    region.as_str(),
+                    "ap-northeast-1" | "ap-southeast-1" | "ap-east-1"
+                ) || !seen.insert(region)
+                {
+                    return Err(err(
+                        "INGRESS_REGIONS",
+                        "use unique Tokyo, Singapore or Hong Kong region codes",
+                    ));
+                }
+            }
+            if lifecycle.bundle.is_empty() || lifecycle.blueprint.is_empty() {
+                return Err(err(
+                    "INGRESS_BUNDLE",
+                    "bundle and blueprint must not be empty",
+                ));
+            }
+        }
         let rotate_cooldown =
             Duration::from_secs(env.num("ROTATE_COOLDOWN_S", 120u64, 0, 86_400)?);
 
@@ -297,6 +348,7 @@ impl Config {
             session_absolute_timeout,
             provider,
             targets,
+            lifecycle,
             rotate_cooldown,
             sub_token: Secret::new(sub_token),
             ingress_token: Secret::new(ingress_token),
@@ -998,16 +1050,17 @@ pub(crate) mod tests {
         assert!(c.wireguard.peer.is_none());
         assert_eq!(c.proxy.hy2_cert_sha256_hex.len(), 64);
 
-        let multi = with(&[
-            (
-                "INGRESS_TARGETS",
-                "tokyo|fake|ap-northeast-1|tokyo;hongkong|fake|ap-east-1|hongkong",
-            ),
-        ])
+        let multi = with(&[(
+            "INGRESS_TARGETS",
+            "tokyo|fake|ap-northeast-1|tokyo;hongkong|fake|ap-east-1|hongkong",
+        )])
         .unwrap();
         assert_eq!(multi.targets.len(), 2);
         assert_eq!(multi.targets[1].id, "hongkong");
-        assert_eq!(multi.targets[1].provider.aws_region.as_deref(), Some("ap-east-1"));
+        assert_eq!(
+            multi.targets[1].provider.aws_region.as_deref(),
+            Some("ap-east-1")
+        );
     }
 
     #[test]

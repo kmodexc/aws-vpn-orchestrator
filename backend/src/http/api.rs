@@ -48,6 +48,28 @@ pub async fn me(principal: Principal) -> Json<MeResponse> {
 }
 
 pub async fn status(State(state): State<AppState>, _p: Admin) -> Result<Response, ApiError> {
+    if let Some(lifecycle) = &state.lifecycle {
+        let view = lifecycle.view().await;
+        let status = state.ingress_status().await?;
+        return Ok(Json(crate::orchestrator::StatusView {
+            provider: "lightsail".into(),
+            region: view
+                .active
+                .as_ref()
+                .map(|d| d.region.clone())
+                .unwrap_or_default(),
+            instance: view
+                .active
+                .as_ref()
+                .map(|d| d.instance.clone())
+                .unwrap_or_default(),
+            state: status.state,
+            public_ip: status.public_ip.map(|ip| ip.to_string()),
+            cooldown_remaining_s: 0,
+            last_rotation_at: None,
+        })
+        .into_response());
+    }
     Ok(Json(state.orchestrator.status_view().await?).into_response())
 }
 
@@ -139,6 +161,7 @@ pub async fn start(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let EmptyRequest {} = parse_optional_json(&headers, body)?;
+    reject_legacy_lifecycle(&state)?;
     state.orchestrator.start(p.actor()).await?;
     Ok(accepted())
 }
@@ -150,6 +173,7 @@ pub async fn stop(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
     let EmptyRequest {} = parse_optional_json(&headers, body)?;
+    reject_legacy_lifecycle(&state)?;
     state.orchestrator.stop(p.actor()).await?;
     Ok(accepted())
 }
@@ -170,6 +194,7 @@ pub async fn rotate(
         Some(r) => Some(crate::util::sanitize_text(r.trim(), MAX_REASON_CHARS)),
         None => None,
     };
+    reject_legacy_lifecycle(&state)?;
     let ip = state.orchestrator.rotate(p.actor(), reason).await?;
     Ok(Json(json!({"public_ip": ip.to_string()})).into_response())
 }
@@ -187,6 +212,7 @@ pub async fn switch(
             ApiError::BadRequest("cannot read request body")
         }
     })?;
+    reject_legacy_lifecycle(&state)?;
     let req: SwitchRequest = parse_json_body(&headers, &body)?;
     if req.target_id.is_empty()
         || req.target_id.len() > 32
@@ -245,7 +271,7 @@ pub async fn subscription(
     _p: Principal,
 ) -> Result<Json<SubscriptionResponse>, ApiError> {
     let cfg = &state.config;
-    let status = state.orchestrator.status().await?;
+    let status = state.ingress_status().await?;
     let settings = state.protocol_settings().await;
     Ok(Json(SubscriptionResponse {
         url: format!("{}/s/{}", cfg.public_base_url, cfg.sub_token.expose()),
@@ -555,5 +581,56 @@ pub async fn method_not_allowed(
     match require_caller(&state, &parts).await {
         Ok(()) => ApiError::MethodNotAllowed,
         Err(e) => e,
+    }
+}
+
+fn reject_legacy_lifecycle(state: &AppState) -> Result<(), ApiError> {
+    if state.lifecycle.is_some() {
+        return Err(ApiError::BadRequest("use on-demand region controls"));
+    }
+    Ok(())
+}
+
+pub async fn lifecycle_view(State(state): State<AppState>, _p: Admin) -> Response {
+    match &state.lifecycle {
+        Some(lifecycle) => Json(lifecycle.view().await).into_response(),
+        None => Json(json!({"enabled": false, "regions": [], "active": null, "cleanup_pending": [], "job": null})).into_response(),
+    }
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleRequest {
+    pub action: String,
+    pub region: Option<String>,
+}
+
+pub async fn lifecycle_action(
+    State(state): State<AppState>,
+    Admin(p): Admin,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let req: LifecycleRequest = parse_optional_json(&headers, body)?;
+    let lifecycle = state
+        .lifecycle
+        .as_ref()
+        .ok_or(ApiError::BadRequest("on-demand mode is disabled"))?;
+    match req.action.as_str() {
+        "switch" => {
+            let region = req
+                .region
+                .ok_or(ApiError::BadRequest("region is required"))?;
+            let job = lifecycle.submit(Some(region), p.actor()).await?;
+            Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+        }
+        "delete" if req.region.is_none() => {
+            let job = lifecycle.submit(None, p.actor()).await?;
+            Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+        }
+        "retry_cleanup" if req.region.is_none() => {
+            lifecycle.retry().await?;
+            Ok(accepted())
+        }
+        _ => Err(ApiError::BadRequest("invalid lifecycle action")),
     }
 }

@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+use crate::config::TargetConfig;
 use crate::error::ApiError;
 use crate::providers::{IngressProvider, IngressStatus};
-use crate::config::TargetConfig;
 use crate::state::{Event, EventAction, StateStore};
 use crate::util::{sanitize_text, unix_now};
 
@@ -354,6 +354,10 @@ impl IngressManager {
         })
     }
 
+    pub fn shared_store(&self) -> Arc<StateStore> {
+        Arc::clone(&self.store)
+    }
+
     pub fn store(&self) -> &StateStore {
         &self.store
     }
@@ -434,10 +438,7 @@ impl IngressManager {
         if current == target_id {
             return target.status_view().await;
         }
-        target
-            .status()
-            .await
-            .map_err(|_| ApiError::Unavailable)?;
+        target.status().await.map_err(|_| ApiError::Unavailable)?;
         let detail = reason
             .filter(|r| !r.trim().is_empty())
             .map(|r| format!("{current} -> {target_id}: {}", sanitize_text(&r, 200)))
@@ -618,19 +619,16 @@ mod tests {
             "hongkong".into(),
             Arc::new(crate::providers::fake::FakeProvider::new()),
         );
-        let manager = IngressManager::new(
-            &configs,
-            providers,
-            Arc::clone(&store),
-            Duration::ZERO,
-        )
-        .unwrap();
+        let manager =
+            IngressManager::new(&configs, providers, Arc::clone(&store), Duration::ZERO).unwrap();
 
         let initial = manager.targets().await;
         assert_eq!(initial.iter().filter(|target| target.active).count(), 1);
-        assert!(initial
-            .iter()
-            .any(|target| target.id == "tokyo" && target.active));
+        assert!(
+            initial
+                .iter()
+                .any(|target| target.id == "tokyo" && target.active)
+        );
 
         let status = manager
             .switch(
@@ -669,9 +667,11 @@ mod tests {
         )
         .unwrap();
         let restored_targets = restored.targets().await;
-        assert!(restored_targets
-            .iter()
-            .any(|target| target.id == "hongkong" && target.active));
+        assert!(
+            restored_targets
+                .iter()
+                .any(|target| target.id == "hongkong" && target.active)
+        );
     }
 
     #[tokio::test]
@@ -686,9 +686,8 @@ mod tests {
         });
         let mut providers: HashMap<String, Arc<dyn IngressProvider>> = HashMap::new();
         providers.insert("default".into(), provider as Arc<dyn IngressProvider>);
-        let manager = Arc::new(
-            IngressManager::new(&configs, providers, store, Duration::ZERO).unwrap(),
-        );
+        let manager =
+            Arc::new(IngressManager::new(&configs, providers, store, Duration::ZERO).unwrap());
 
         assert_eq!(
             manager

@@ -330,13 +330,52 @@ destroy_ingress() { # region name
 # ------------------------------------------------------------------------------------------
 # IAM user for the control plane (narrow policy, pinned to one instance + region)
 # ------------------------------------------------------------------------------------------
+# Validate before provisioning. Preserve the implicit target's ID so persisted active-target
+# state continues to resolve when converting a single-target installation.
+prepare_added_target() { # id region name
+  local id=$1 region=$2 name=$3 targets item existing_id kind existing_region existing_name extra found=0
+  [[ ${id} =~ ^[A-Za-z0-9_-]{1,32}$ ]] || die "invalid --add-target ID (use 1-32 letters, digits, _ or -)"
+  targets="$(env_get INGRESS_TARGETS)"
+  if [[ -z ${targets} ]]; then
+    [[ $(env_get PROVIDER) == lightsail ]] || die "--add-target requires an existing Lightsail setup"
+    existing_region="$(env_get AWS_REGION)"
+    existing_name="$(env_get INGRESS_INSTANCE)"
+    validate_region "${existing_region}"
+    validate_instance_name "${existing_name}"
+    targets="default|lightsail|${existing_region}|${existing_name}"
+  fi
+  [[ ${targets} != *';' && ${targets} != ';'* && ${targets} != *';;'* ]] || die "invalid INGRESS_TARGETS"
+  local entries=()
+  IFS=';' read -r -a entries <<<"${targets}"
+  for item in "${entries[@]}"; do
+    IFS='|' read -r existing_id kind existing_region existing_name extra <<<"${item}"
+    [[ ${existing_id} =~ ^[A-Za-z0-9_-]{1,32}$ && ${kind} == lightsail && -z ${extra} && ${item} != *'|' ]] \
+      || die "--add-target requires valid Lightsail entries in INGRESS_TARGETS"
+    validate_region "${existing_region}"
+    validate_instance_name "${existing_name}"
+    if [[ ${existing_id} == "${id}" ]]; then
+      [[ ${region}/${name} == "${existing_region}/${existing_name}" ]] || die "target ${id} already points to another instance"
+      found=1
+    elif [[ ${region}/${name} == "${existing_region}/${existing_name}" ]]; then
+      die "instance already registered as target ${existing_id}"
+    fi
+  done
+  UPDATED_TARGETS=${targets}
+  if [[ ${found} -eq 0 ]]; then
+    UPDATED_TARGETS+=";${id}|lightsail|${region}|${name}"
+  fi
+  ((${#UPDATED_TARGETS} <= 4096)) || die "INGRESS_TARGETS would exceed 4096 characters"
+}
+
 render_policy() { # region resource-id
   sed -e "s/<REGION>/$1/g" -e "s/<ACCOUNT_ID>/${ACCOUNT_ID}/g" -e "s/<INSTANCE_RESOURCE_ID>/$2/g" \
     "${REPO_ROOT}/deploy/iam/lightsail.json"
 }
 
-ensure_iam() { # region name
+ensure_iam() { # region name [policy-name]
   local region=$1 name=$2 arn resource_id policy err keys current count id secret
+  local policy_name=${3:-${POLICY_NAME}}
+  local managed_name managed_arn
   arn="$(instance_field "${region}" "${name}" arn)"
   resource_id="${arn##*/}"
   [[ ${resource_id} =~ ^[A-Za-z0-9-]+$ ]] || die "unexpected instance ARN ${arn}"
@@ -349,16 +388,32 @@ ensure_iam() { # region name
     aws_ iam create-user --user-name "${IAM_USER}" \
       --tags "Key=${MANAGED_TAG_KEY},Value=managed" --output text >/dev/null
   fi
-  log "setting inline policy ${POLICY_NAME} (instance ${name}, region ${region})"
-  aws_ iam put-user-policy --user-name "${IAM_USER}" --policy-name "${POLICY_NAME}" \
-    --policy-document "${policy}"
+  if [[ -n ${ADD_TARGET:-} ]]; then
+    # User inline policies share a 2048-character quota. Added targets use managed policies;
+    # include the immutable instance UUID so an existing policy cannot target another instance.
+    managed_name="${policy_name}-${resource_id}-v1"
+    managed_arn="arn:aws:iam::${ACCOUNT_ID}:policy/${managed_name}"
+    if ! err="$(aws_ iam get-policy --policy-arn "${managed_arn}" --output text 2>&1 >/dev/null)"; then
+      [[ ${err} == *NoSuchEntity* ]] || die "get-policy failed: ${err}"
+      aws_ iam create-policy --policy-name "${managed_name}" --policy-document "${policy}" --output text >/dev/null
+    fi
+    aws_ iam attach-user-policy --user-name "${IAM_USER}" --policy-arn "${managed_arn}"
+    log "attached policy ${managed_name} (instance ${name}, region ${region})"
+  else
+    log "setting inline policy ${policy_name} (instance ${name}, region ${region})"
+    aws_ iam put-user-policy --user-name "${IAM_USER}" --policy-name "${policy_name}" \
+      --policy-document "${policy}"
+  fi
 
-  keys="$(aws_ iam list-access-keys --user-name "${IAM_USER}" --query 'AccessKeyMetadata[].AccessKeyId' --output text)"
+  keys="$(aws_ iam list-access-keys --user-name "${IAM_USER}" --query 'AccessKeyMetadata[?Status==`Active`].AccessKeyId' --output text)"
+  keys="$(printf '%s' "${keys}" | tr '\t\r\n' '   ')"
   current="$(env_get AWS_ACCESS_KEY_ID)"
   if [[ -n ${current} && " ${keys} " == *" ${current} "* ]]; then
     log "keeping existing access key ${current} from .env"
     return 0
   fi
+  [[ -z ${ADD_TARGET:-} ]] || die "--add-target requires an existing active app key in .env; refusing to replace credentials"
+  keys="$(aws_ iam list-access-keys --user-name "${IAM_USER}" --query 'AccessKeyMetadata[].AccessKeyId' --output text)"
   count="$(printf '%s\n' ${keys} | grep -c . || true)"
   ((count < 2)) || die "${IAM_USER} already has 2 access keys and none matches .env; delete one: aws iam delete-access-key --user-name ${IAM_USER} --access-key-id <id>"
   log "creating a new access key for ${IAM_USER} and writing it to .env"
@@ -433,12 +488,16 @@ parse_common_args() {
   REGION="" NAME="" BUNDLE="" BLUEPRINT="${DEFAULT_BLUEPRINT}" AZ="" SSH_CIDR="" NO_SSH=0
   IAM_USER="vpn-control" BUDGET_EMAIL="" BUDGET_USD=20
   EXTRA_ARGS=()
+  ADD_TARGET=""
   while (($#)); do
     case $1 in
       --env) ENV_FILE=${2:?}; shift ;;
       --profile) AWS_ARGS+=(--profile "${2:?}"); shift ;;
       --region) REGION=${2:?}; shift ;;
       --name) NAME=${2:?}; shift ;;
+      --add-target)
+        [[ ${SCRIPT_NAME} == setup-lightsail ]] || die "--add-target is only supported by setup-lightsail.sh"
+        ADD_TARGET=${2:?}; shift ;;
       --bundle) BUNDLE=${2:?}; shift ;;
       --blueprint) BLUEPRINT=${2:?}; shift ;;
       --az) AZ=${2:?}; shift ;;

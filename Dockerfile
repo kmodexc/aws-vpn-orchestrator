@@ -73,6 +73,8 @@ COPY --from=planner /src/backend/recipe.json recipe.json
 # Cached layer: all dependencies (incl. the AWS SDK). Invalidated only by Cargo.toml/Cargo.lock.
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY backend/ ./
+# Embedded by the Rust provisioning module; available without a shell in the runtime image.
+COPY deploy/ingress/bootstrap.sh /src/deploy/ingress/bootstrap.sh
 RUN cargo build --release --locked --bin vpn-control \
  && install -D -m 0755 target/release/vpn-control /out/app/vpn-control \
  && strip /out/app/vpn-control \

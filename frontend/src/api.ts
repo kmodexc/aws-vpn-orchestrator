@@ -31,6 +31,44 @@ export interface Me {
   is_admin: boolean;
 }
 
+export interface Deployment {
+  id: string;
+  region: string;
+  instance: string;
+  static_ip: string | null;
+  public_ip: string | null;
+  managed: boolean;
+}
+export interface LifecycleJob {
+  id: string;
+  stage: "creating" | "waiting_ready" | "reconnect" | "cleaning" | "failed" | "complete";
+  cleanup_after: number | null;
+  error: string | null;
+}
+export interface LifecycleView {
+  enabled: boolean;
+  regions: string[];
+  active: Deployment | null;
+  cleanup_pending: Deployment[];
+  job: LifecycleJob | null;
+}
+export function parseLifecycle(v: unknown): LifecycleView {
+  if (!isObject(v) || typeof v.enabled !== "boolean" || !Array.isArray(v.regions) ||
+      !v.regions.every(isString) || !Array.isArray(v.cleanup_pending)) return bad();
+  function deployment(d: unknown): d is Deployment {
+    return isObject(d) && isString(d.id) && isString(d.region) && isString(d.instance) &&
+      (d.static_ip === null || isString(d.static_ip)) && (d.public_ip === null || isString(d.public_ip)) &&
+      typeof d.managed === "boolean";
+  }
+  if (v.active !== null && !deployment(v.active)) return bad();
+  if (!v.cleanup_pending.every(deployment)) return bad();
+  if (v.job !== null && (!isObject(v.job) || !isString(v.job.id) ||
+      !["creating", "waiting_ready", "reconnect", "cleaning", "failed", "complete"].includes(String(v.job.stage)) ||
+      (v.job.cleanup_after !== null && typeof v.job.cleanup_after !== "number") ||
+      (v.job.error !== null && !isString(v.job.error)))) return bad();
+  return v as unknown as LifecycleView;
+}
+
 export interface Status {
   provider: string;
   region: string;
@@ -600,6 +638,14 @@ export class ApiClient {
 
   async status(): Promise<Status> {
     return parseStatus(await this.get("/api/status"));
+  }
+
+  async lifecycle(): Promise<LifecycleView> {
+    return parseLifecycle(await this.get("/api/ingress/lifecycle"));
+  }
+
+  async lifecycleAction(action: "switch" | "delete" | "retry_cleanup", region?: string): Promise<void> {
+    await this.post("/api/ingress/lifecycle", { action, ...(region ? { region } : {}) });
   }
 
   async targets(): Promise<IngressTarget[]> {

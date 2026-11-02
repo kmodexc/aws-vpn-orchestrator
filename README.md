@@ -161,6 +161,21 @@ ingress configures itself within a few minutes and keeps retrying the config dow
 
 #### Phone-triggered region switching
 
+To add regions without replacing the current ingress, use the existing `.env` and admin
+profile (these commands create billable Lightsail instances):
+
+```bash
+deploy/aws/setup-lightsail.sh --profile default --region ap-southeast-1 --name vpn-ingress-singapore --add-target singapore
+deploy/aws/setup-lightsail.sh --profile default --region ap-east-1 --name vpn-ingress-hongkong --add-target hongkong
+```
+
+`--add-target` preserves the primary settings and active app key, adds a separate instance-scoped
+customer-managed policy per target, and updates `INGRESS_TARGETS`. The original ingress is registered as
+`default` when first converting from single-target mode. Repeating the same target is supported;
+reusing its ID for a different instance is rejected. Enable opt-in regions before running setup.
+Restart the app after adding targets. Rebuild and teardown remain single-target tools; do not
+use them to manage this shared multi-target installation.
+
 The dashboard can promote between already-provisioned targets without restarting the control
 server. Add `INGRESS_TARGETS` to `.env` using the format
 `id|provider|region|instance;...`, for example:
@@ -511,3 +526,81 @@ This application is built to be exposed on the public internet. Highlights:
 
 Threat model, controls, secret rotation and incident handling: **[docs/security.md](docs/security.md)**.
 Report security issues privately to the maintainer, not via public issues.
+
+### On-demand regions: keep one billed ingress
+
+The optional on-demand mode creates a replacement Lightsail ingress when you select a region
+from the phone dashboard, verifies its bootstrap report and TCP proxy listener, makes it active,
+and deletes the old instance and its static IP after a reconnect window. Closing your browser
+does not cancel the job. Jobs and cleanup inventory survive backend restarts in `/data/state.json`.
+The control-plane host must remain online; its hosting costs are separate.
+
+To enable on an existing installation:
+
+1. In the legacy dashboard, select the server you intend to retain initially. Ensure its
+   instance has `vpn-orchestrator=managed` and any attached static IP uses `vpn-orchestrator-*`.
+   Adoption explicitly allows that server's disk and IP to be deleted on a later switch.
+2. With your admin CLI profile, grant the existing app identity provisioning permissions:
+
+   ```bash
+   bash deploy/aws/configure-on-demand-iam.sh --profile default --iam-user vpn-control
+   ```
+
+   This attaches a customer-managed policy from `deploy/iam/lightsail-provisioning.json`.
+   It allows creation of tagged instances and management of tagged instances in Tokyo,
+   Singapore and Hong Kong. Static-IP operations are region-wide because Lightsail cannot
+   restrict them by tags. The app itself releases only recorded, managed IP names. The identity
+   has no IAM administration permissions. Existing policies and access keys remain unchanged.
+3. Set these in the app host's `.env`:
+
+   ```dotenv
+   INGRESS_ON_DEMAND=true
+   INGRESS_ADOPT_EXISTING=true
+   INGRESS_REGIONS=ap-northeast-1,ap-southeast-1,ap-east-1
+   INGRESS_BUNDLE=nano_3_0
+   INGRESS_BLUEPRINT=ubuntu_24_04
+   INGRESS_RECONNECT_GRACE_S=120
+   ```
+
+   Keep the existing `PROVIDER`, `AWS_REGION`, `INGRESS_INSTANCE`, `INGRESS_TARGETS` (if present),
+   and dedicated app key for initial adoption. Adoption runs only when lifecycle state is absent.
+   To start with no adopted server, set `INGRESS_ADOPT_EXISTING=false`; existing cloud resources
+   are not deleted or managed by doing so.
+4. Build/deploy this version (restarting an old published image does not install these changes):
+
+   ```bash
+   docker compose build app
+   docker compose up -d --no-build --force-recreate app
+   ```
+
+   The runtime uses the Rust AWS SDK; it does not need AWS CLI or a shell in the container.
+5. Use **Switch region** on your phone. Once the replacement is active, refresh the VPN client's
+   subscription and reconnect within the configured window. Old connections end when the old
+   server is deleted. Readiness checks establish local proxy health and reachability, not an
+   end-to-end VPN connection from your phone.
+
+**Existing standby servers are not automatically removed.** Delete unused legacy Tokyo/Singapore
+instances and release their IPs separately after confirming which server was adopted. Otherwise,
+those servers continue billing independently of this mode. Do not use legacy rebuild/teardown
+scripts on a shared on-demand installation.
+
+The dashboard's **Delete server and release IP** removes the active ingress, including its disk.
+There are no automatic snapshots; recreating uses the existing shared protocol configuration.
+No active server means subscription requests return 503, rather than advertising an old IP.
+A cleanup failure is shown prominently with **Retry cleanup**, and new provisioning is blocked
+until pending cleanup is resolved. AWS errors or an offline control plane can extend the period
+when both old and new resources are billed; billing only stops once deletion succeeds.
+
+Back up `/data/state.json`: it is the resource inventory. Corrupt lifecycle state stops startup
+rather than silently creating a new inventory. Do not remove it or disable on-demand mode while
+it owns resources; explicitly migrate or delete resources first. Run only one backend instance
+against this state volume. Changes to ports, blueprint or bundle apply to subsequently created
+servers, not an already-running server.
+
+Local verification (no cloud provisioning):
+
+```bash
+cargo test --locked --manifest-path backend/Cargo.toml
+npm --prefix frontend test
+npm --prefix frontend run build
+```

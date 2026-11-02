@@ -52,6 +52,8 @@ pub struct PersistedState {
     /// Active configured ingress target. `None` keeps legacy installations on their first target.
     #[serde(default)]
     pub active_target_id: Option<String>,
+    #[serde(default)]
+    pub lifecycle: Option<crate::lifecycle::LifecycleState>,
 }
 
 impl PersistedState {
@@ -119,6 +121,22 @@ impl StateStore {
         })
     }
 
+    /// Lifecycle inventory must never silently reset on corrupt state: that can orphan billed resources.
+    pub fn open_strict(dir: &Path) -> anyhow::Result<Self> {
+        match std::fs::read(dir.join(STATE_FILE)) {
+            Ok(bytes) => {
+                serde_json::from_slice::<PersistedState>(&bytes).map_err(|_| {
+                    anyhow::anyhow!(
+                        "state.json is corrupt; restore it before enabling on-demand provisioning"
+                    )
+                })?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Self::open(dir)
+    }
+
     /// A copy of the current state without awaiting — for startup code, before any task runs.
     /// Falls back to the default if the lock is (unexpectedly) held.
     pub fn peek(&self) -> PersistedState {
@@ -153,6 +171,19 @@ impl StateStore {
         let to_write = guard.clone();
         tokio::task::spawn_blocking(move || write_atomic(&dir, &to_write)).await??;
         Ok(result)
+    }
+
+    /// Commit to disk before publishing in memory. Used for destructive lifecycle transitions.
+    pub async fn durable_update(&self, f: impl FnOnce(&mut PersistedState)) -> anyhow::Result<()> {
+        let mut guard = self.data.lock().await;
+        let mut next = guard.clone();
+        f(&mut next);
+        next.enforce_caps();
+        let dir = self.dir.clone();
+        let bytes = next.clone();
+        tokio::task::spawn_blocking(move || write_atomic(&dir, &bytes)).await??;
+        *guard = next;
+        Ok(())
     }
 
     /// Append an event (convenience wrapper around [`update`](Self::update)).
@@ -226,6 +257,32 @@ fn write_atomic(dir: &Path, state: &PersistedState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_durable_write_does_not_publish_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join(STATE_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(STATE_FILE)).unwrap();
+        assert!(
+            store
+                .durable_update(|s| s.active_target_id = Some("new".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(store.snapshot().await.active_target_id, None);
+    }
+
+    #[test]
+    fn lifecycle_state_corruption_is_not_silently_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(STATE_FILE), b"invalid").unwrap();
+        assert!(StateStore::open_strict(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(STATE_FILE)).unwrap(),
+            b"invalid"
+        );
+    }
 
     #[tokio::test]
     async fn persists_and_reloads() {

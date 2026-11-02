@@ -24,6 +24,7 @@ aws-sdk-lightsail = { version = "1.135.0", default-features = false, features = 
 axum = "0.8"
 base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1"
 getrandom = "0.4.3"
 hex = "0.4.3"
 http-body-util = "0.1.5"

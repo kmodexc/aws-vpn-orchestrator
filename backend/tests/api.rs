@@ -20,8 +20,8 @@ use vpn_control::AppState;
 use vpn_control::auth::session::SessionData;
 use vpn_control::cli::gen_env;
 use vpn_control::config::Config;
-use vpn_control::providers::fake::FakeProvider;
 use vpn_control::providers::IngressProvider;
+use vpn_control::providers::fake::FakeProvider;
 
 const BASE: &str = "https://vpn.example.com";
 const INDEX_HTML: &str = "<!doctype html><title>spa</title>";
@@ -247,6 +247,7 @@ async fn healthz_is_plain_ok() {
 async fn api_requires_auth_and_is_not_cached() {
     let app = app();
     for uri in [
+        "/api/ingress/lifecycle",
         "/api/status",
         "/api/me",
         "/api/events",
@@ -314,6 +315,7 @@ async fn user_role_sees_only_the_subscription() {
 
     // everything else is forbidden, reads and writes alike
     for uri in [
+        "/api/ingress/lifecycle",
         "/api/status",
         "/api/events",
         "/api/wireguard",
@@ -447,9 +449,7 @@ async fn configured_targets_can_be_listed_and_switched() {
     )]);
     let (cookie, csrf) = app.login(&["vpn-admin"]);
 
-    let resp = app
-        .get_with_session("/api/ingress/targets", &cookie)
-        .await;
+    let resp = app.get_with_session("/api/ingress/targets", &cookie).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let targets = body_json(resp).await;
     assert_eq!(targets.as_array().unwrap().len(), 2);
@@ -491,7 +491,10 @@ async fn target_switch_requires_valid_json_admin_and_csrf() {
     for (content_type, body) in [
         (None, r#"{"target_id":"hongkong"}"#),
         (Some("text/plain"), r#"{"target_id":"hongkong"}"#),
-        (Some("application/json"), r#"{"target_id":"hongkong","extra":true}"#),
+        (
+            Some("application/json"),
+            r#"{"target_id":"hongkong","extra":true}"#,
+        ),
         (Some("application/json"), "[]"),
     ] {
         let mut builder = request(Method::POST, "/api/ingress/switch")
@@ -501,10 +504,12 @@ async fn target_switch_requires_valid_json_admin_and_csrf() {
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
-        let resp = app
-            .send(builder.body(Body::from(body)).unwrap())
-            .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{content_type:?} {body}");
+        let resp = app.send(builder.body(Body::from(body)).unwrap()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{content_type:?} {body}"
+        );
     }
 
     let resp = app
@@ -1596,4 +1601,31 @@ async fn ingress_reports_feed_telemetry_and_logs() {
     )
     .await;
     assert_eq!(t["report"]["log_lines"], 0);
+}
+
+#[tokio::test]
+async fn lifecycle_requires_admin_and_csrf_and_reports_disabled_mode() {
+    let app = app();
+    let (cookie, csrf) = app.login(&["vpn-admin"]);
+    let response = app
+        .get_with_session("/api/ingress/lifecycle", &cookie)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["enabled"], false);
+    for (token, expected) in [
+        (None, StatusCode::FORBIDDEN),
+        (Some(csrf.as_str()), StatusCode::BAD_REQUEST),
+    ] {
+        let mut builder = request(Method::POST, "/api/ingress/lifecycle")
+            .header(header::COOKIE, session_cookie(&cookie))
+            .header(header::ORIGIN, BASE)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header("x-csrf-token", token);
+        }
+        let response = app
+            .send(builder.body(Body::from(r#"{"action":"delete"}"#)).unwrap())
+            .await;
+        assert_eq!(response.status(), expected);
+    }
 }

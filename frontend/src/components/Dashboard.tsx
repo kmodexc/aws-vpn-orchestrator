@@ -17,6 +17,7 @@ import { LogsCard } from "./LogsCard";
 import { SettingsCard } from "./SettingsCard";
 import { StatusCard, type Action } from "./StatusCard";
 import { SubscriptionCard } from "./SubscriptionCard";
+import { LifecycleCard } from "./LifecycleCard";
 import { TargetCard } from "./TargetCard";
 import { WireGuardCard } from "./WireGuardCard";
 
@@ -38,6 +39,7 @@ interface Cooldown {
 
 export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props) {
   const visible = usePageVisible();
+  const [onDemand, setOnDemand] = useState<boolean | null>(null);
 
   const [status, setStatus] = useState<Status | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -210,7 +212,8 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
         </p>
       )}
       <main className="main">
-        <StatusCard
+        <LifecycleCard api={api} status={status} statusError={statusError} onMode={setOnDemand} onChanged={manualRefresh} />
+        {onDemand === false && <StatusCard
           status={status}
           loading={loading}
           statusError={statusError}
@@ -221,8 +224,8 @@ export function Dashboard({ api, me, onLogout, loggingOut, logoutError }: Props)
           actionNotice={actionNotice}
           onAction={(a, r) => void runAction(a, r)}
           onRefresh={manualRefresh}
-        />
-        <TargetCard api={api} onChanged={manualRefresh} />
+        />}
+        {onDemand === false && <TargetCard api={api} onChanged={manualRefresh} />}
         <SubscriptionCard
           api={api}
           ipKey={status?.public_ip ?? null}

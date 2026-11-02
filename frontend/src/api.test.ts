@@ -426,3 +426,19 @@ describe("helpers", () => {
   });
 
 });
+
+describe("on-demand lifecycle", () => {
+  it("posts a region switch with the session CSRF token", async () => {
+    const fetch = mockFetch(jsonResponse(202, { id: "job" }));
+    const api = new ApiClient({ fetch });
+    api.setCsrfToken("csrf-123");
+    await api.lifecycleAction("switch", "ap-east-1");
+    expect(fetch).toHaveBeenCalledWith("/api/ingress/lifecycle", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ action: "switch", region: "ap-east-1" }),
+    }));
+  });
+  it("rejects malformed lifecycle responses", async () => {
+    const api = new ApiClient({ fetch: mockFetch(jsonResponse(200, { enabled: true })) });
+    await expect(api.lifecycle()).rejects.toBeInstanceOf(ApiError);
+  });
+});

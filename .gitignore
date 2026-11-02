@@ -13,3 +13,6 @@ node_modules/
 # misc
 .DS_Store
 *.log
+
+# workspace-local Codex settings may contain credentials
+/.codex/

@@ -42,9 +42,9 @@ const CONFIRM: Record<Action, ConfirmCfg> = {
     danger: false,
   },
   stop: {
-    title: "Stop the ingress server?",
-    message: "All VPN connections drop until the server is started again.",
-    label: "Stop",
+    title: "Power off the ingress server?",
+    message: "All VPN connections drop. Lightsail billing continues while the instance is stopped.",
+    label: "Power off (billing continues)",
     danger: true,
   },
   rotate: {
@@ -173,7 +173,7 @@ export function StatusCard({
             setConfirming("stop");
           }}
         >
-          {busy === "stop" ? BUSY_LABEL.stop : "Stop"}
+          {busy === "stop" ? BUSY_LABEL.stop : "Power off (billing continues)"}
         </button>
         <button
           type="button"

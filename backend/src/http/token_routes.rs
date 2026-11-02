@@ -32,7 +32,7 @@ pub async fn subscription(
         tracing::info!("subscription request with wrong token");
         return plain_not_found();
     }
-    let status = match state.orchestrator.status().await {
+    let status = match state.ingress_status().await {
         Ok(s) => s,
         Err(_) => return plain_status(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
     };
@@ -123,8 +123,16 @@ pub async fn report(
         return plain_status(StatusCode::BAD_REQUEST, "Bad Request");
     }
     let reported = report.config_sha256.to_ascii_lowercase();
-    state.telemetry.record(report);
     let (_, current) = state.served_config().await;
+    if reported == current && report.uptime_s.is_some() && report.connections.is_some() {
+        if let (Some(lifecycle), Some(id)) = (&state.lifecycle, &report.deployment_id) {
+            if let Err(e) = lifecycle.report_ready(id).await {
+                tracing::error!(error = %e, "could not persist readiness report");
+                return plain_status(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
+            }
+        }
+    }
+    state.telemetry.record(report);
     let mut resp = Json(ReportReply {
         config_stale: reported != current,
         config_sha256: current,

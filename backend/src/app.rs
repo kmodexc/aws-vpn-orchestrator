@@ -25,6 +25,7 @@ pub struct AppInner {
     pub static_files: StaticFiles,
     /// Counters and recent log lines reported by the ingress (memory only).
     pub telemetry: Telemetry,
+    pub lifecycle: Option<Arc<crate::lifecycle::Lifecycle>>,
 }
 
 /// Cheaply clonable handle to the shared application state.
@@ -56,7 +57,16 @@ impl AppState {
         config: Config,
         providers: std::collections::HashMap<String, Arc<dyn IngressProvider>>,
     ) -> anyhow::Result<Self> {
-        let store = Arc::new(StateStore::open(&config.state_dir)?);
+        let store = Arc::new(if config.lifecycle.enabled {
+            StateStore::open_strict(&config.state_dir)?
+        } else {
+            StateStore::open(&config.state_dir)?
+        });
+        if !config.lifecycle.enabled && store.peek().lifecycle.is_some() {
+            anyhow::bail!(
+                "on-demand state exists; keep INGRESS_ON_DEMAND=true or explicitly migrate its resources and state before disabling"
+            );
+        }
         let telemetry = Telemetry::default();
         // A debug window that was running when the previous process stopped must still end —
         // and its lines must still be purged — after a restart.
@@ -87,7 +97,20 @@ impl AppState {
             limiter: RateLimiter::default(),
             static_files,
             telemetry,
+            lifecycle: None,
         })))
+    }
+
+    pub async fn ingress_status(
+        &self,
+    ) -> Result<crate::providers::IngressStatus, crate::error::ApiError> {
+        match &self.lifecycle {
+            Some(lifecycle) => lifecycle
+                .status()
+                .await
+                .map_err(|e| crate::error::ApiError::unavailable(e.to_string())),
+            None => self.orchestrator.status().await,
+        }
     }
 
     /// The protocol settings in effect: the stored override, else the `.env` defaults.
@@ -164,7 +187,24 @@ fn log_startup(cfg: &Config) {
 pub async fn run(config: Config) -> anyhow::Result<()> {
     log_startup(&config);
     let providers = providers::build_all(&config).await?;
-    let state = AppState::new_with_providers(config, providers)?;
+    let mut state = AppState::new_with_providers(config, providers)?;
+    if state.config.lifecycle.enabled {
+        let cloud = Arc::new(
+            crate::providers::provisioning::LightsailProvisioner::new(Arc::clone(&state.config))
+                .await,
+        );
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new(
+            state.orchestrator.shared_store(),
+            cloud,
+            state.config.lifecycle.regions.clone(),
+            state.config.lifecycle.reconnect_grace_s,
+        ));
+        lifecycle.initialize(&state.config).await?;
+        Arc::get_mut(&mut state.0)
+            .ok_or_else(|| anyhow::anyhow!("application state already shared"))?
+            .lifecycle = Some(Arc::clone(&lifecycle));
+        lifecycle.wake();
+    }
     let app = crate::http::router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.config.bind_addr).await?;
@@ -175,6 +215,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
+            if let Some(lifecycle) = &janitor_state.lifecycle {
+                lifecycle.wake();
+            }
             janitor_state.sessions.purge_expired();
             janitor_state.limiter.purge(Instant::now());
         }

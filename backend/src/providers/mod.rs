@@ -4,6 +4,7 @@
 pub mod ec2;
 pub mod fake;
 pub mod lightsail;
+pub mod provisioning;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;

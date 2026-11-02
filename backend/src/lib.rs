@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod http;
+pub mod lifecycle;
 pub mod orchestrator;
 pub mod providers;
 pub mod secret;

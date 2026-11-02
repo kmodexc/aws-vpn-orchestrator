@@ -342,6 +342,7 @@ try:
 except Exception:
     pass
 body = {
+    "deployment_id": open("/etc/vpn-deployment-id").read().strip() if __import__("os").path.isfile("/etc/vpn-deployment-id") else None,
     "version": version or "unknown",
     "uptime_s": int(uptime_s) if uptime_s.isdigit() else None,
     "connections": connections,
